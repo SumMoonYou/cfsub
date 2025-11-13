@@ -25,7 +25,7 @@ async function handleRequest(request) {
       } else return new Response("密码错误", { status: 403 });
     }
 
-    // ---------------- 保存订阅（无需密码） ----------------
+    // ---------------- 保存订阅（新增） ----------------
     if (path === "/save") {
       const displayName = url.searchParams.get("key") || "未命名";
       let days = parseInt(url.searchParams.get("days"), 10);
@@ -34,7 +34,7 @@ async function handleRequest(request) {
       const content = await request.text();
       if (!content) return new Response("未提供订阅内容", { status: 400 });
 
-      const realKey = generateRandomKey(8);
+      const realKey = generateRandomKey(8); // 新增时生成新 key
       const expire = days > 0 ? Date.now() + days * 24 * 60 * 60 * 1000 : null;
       const item = { realKey, displayName, content, expire };
       await kv.put(realKey, JSON.stringify(item));
@@ -55,9 +55,10 @@ async function handleRequest(request) {
       if (!item || !item.content) return new Response("订阅数据异常", { status: 500 });
       if (item.expire && Date.now() > item.expire) return new Response("订阅已过期", { status: 403 });
 
-      // 使用 displayName，如果没有则显示 realKey
       const nameOrKey = item.displayName || realKey;
-      await sendTGNotificationAccess(nameOrKey);
+      const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "未知IP";
+
+      await sendTGNotificationAccess(nameOrKey, ip);
 
       return new Response(btoa(item.content), { headers: { "Content-Type": "text/plain;charset=UTF-8" } });
     }
@@ -78,6 +79,7 @@ async function handleRequest(request) {
 
         const oldValue = await kv.get(realKey);
         if (!oldValue) return new Response("订阅不存在", { status: 404 });
+
         let oldItem;
         try { oldItem = JSON.parse(oldValue); } catch(e) { return new Response("订阅数据异常", { status: 500 }); }
 
@@ -118,7 +120,6 @@ async function handleRequest(request) {
           allItems.push({ displayName: item.displayName, realKey: item.realKey, remainingDays: remaining, content: item.content });
         }
 
-        // 只在搜索非空时过滤
         if (search && search.trim() !== "") {
           allItems = allItems.filter(i => i.displayName.toLowerCase().includes(search.toLowerCase()));
         }
@@ -151,7 +152,6 @@ function generateRandomKey(len=8){
   return s;
 }
 
-// 通用发送 TG 消息
 async function sendTGNotification(message) {
   try {
     const res = await fetch(`https://api.telegram.org/bot${EVA.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -166,15 +166,28 @@ async function sendTGNotification(message) {
 
 // 管理操作通知
 async function sendTGNotificationAdmin(key, action){
-  await sendTGNotification(`订阅 ${action}: ${key}\n时间: ${new Date().toLocaleString()}`);
+  await sendTGNotification(`📌 *订阅 ${action}*\n订阅 Key: ${key}\n时间: ${new Date().toLocaleString()}`);
 }
 
-// 访问订阅通知，显示 displayName 或 realKey
-async function sendTGNotificationAccess(nameOrKey){
-  await sendTGNotification(`有人访问订阅: ${nameOrKey}\n时间: ${new Date().toLocaleString()}`);
+// 访问订阅通知，增加 IP，美化 Markdown
+async function sendTGNotificationAccess(nameOrKey, ip) {
+  const time = new Date().toLocaleString();
+  const message = `📌 *订阅访问通知*\n\n` +
+                  `*订阅名称:* ${nameOrKey}\n` +
+                  `*访问 IP:* ${ip}\n` +
+                  `*访问时间:* ${time}`;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${EVA.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: EVA.TELEGRAM_CHAT_ID, text: message, parse_mode: "Markdown" })
+    });
+    const data = await res.json();
+    if (!data.ok) console.error("TG通知失败:", data);
+  } catch (e) { console.error("TG fetch 异常:", e); }
 }
 
-// ---------------- HTML 前端逻辑保持不变 ----------------
+// ---------------- 前端 HTML ----------------
 function generateHTML(){ 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -224,11 +237,11 @@ th{background:#4facfe;color:#fff;}
 <div class="pagination" id="pagination"></div>
 </div>
 <script>
-// 前端逻辑保持不变（分页、搜索、复制、编辑、删除）
 const ADMIN_PASSWORD = "${EVA.ADMIN_PASSWORD}";
+let currentPage=1,currentSearch="",currentSort="displayName",currentOrder="asc",currentEditingKey=null;
+
 document.addEventListener("DOMContentLoaded", ()=>{
-  const loginBtn=document.getElementById("loginBtn");
-  loginBtn.addEventListener("click", async ()=>{
+  document.getElementById("loginBtn").addEventListener("click", async ()=>{
     const pw=document.getElementById("adminPassword").value.trim();
     if(pw===ADMIN_PASSWORD){
       document.getElementById("loginDiv").style.display="none";
@@ -237,9 +250,14 @@ document.addEventListener("DOMContentLoaded", ()=>{
       await fetch("/login?password="+ADMIN_PASSWORD).catch(()=>{});
     } else alert("密码错误");
   });
+  document.getElementById("saveBtn").addEventListener("click", saveData);
+  document.getElementById("searchBtn").addEventListener("click", ()=>{
+    currentSearch=document.getElementById("search").value.trim();
+    currentSort=document.getElementById("sort").value;
+    currentOrder=document.getElementById("order").value;
+    loadKeyList(1);
+  });
 });
-
-let currentPage=1,currentSearch="",currentSort="displayName",currentOrder="asc";
 
 async function loadKeyList(page=1){
   currentPage=page;
@@ -250,20 +268,13 @@ async function loadKeyList(page=1){
     const tbody=document.getElementById("keylist"); tbody.innerHTML="";
     data.items.forEach(item=>{
       const tr=document.createElement("tr");
-      const tdName=document.createElement("td"); tdName.textContent=item.displayName; tr.appendChild(tdName);
-      const tdDays=document.createElement("td"); tdDays.textContent=item.remainingDays; tr.appendChild(tdDays);
-      const tdBase64=document.createElement("td"); const btnBase64=document.createElement("button");
-      btnBase64.className="copy-btn"; btnBase64.textContent="复制"; btnBase64.addEventListener("click",()=>copyBase64(item.realKey));
-      tdBase64.appendChild(btnBase64); tr.appendChild(tdBase64);
-      const tdURL=document.createElement("td"); const btnURL=document.createElement("button");
-      btnURL.className="copy-btn"; btnURL.textContent="复制"; btnURL.addEventListener("click",()=>copyURL(item.realKey));
-      tdURL.appendChild(btnURL); tr.appendChild(tdURL);
-      const tdEdit=document.createElement("td"); const btnEdit=document.createElement("button");
-      btnEdit.className="edit-btn"; btnEdit.textContent="编辑"; btnEdit.addEventListener("click",()=>editItem(item.realKey, encodeURIComponent(item.displayName), encodeURIComponent(item.content)));
-      tdEdit.appendChild(btnEdit); tr.appendChild(tdEdit);
-      const tdDelete=document.createElement("td"); const btnDelete=document.createElement("button");
-      btnDelete.className="delete-btn"; btnDelete.textContent="删除"; btnDelete.addEventListener("click",()=>deleteKey(item.realKey));
-      tdDelete.appendChild(btnDelete); tr.appendChild(tdDelete);
+      tr.innerHTML=\`
+        <td>\${item.displayName}</td>
+        <td>\${item.remainingDays}</td>
+        <td><button class="copy-btn" onclick="copyBase64('\${item.realKey}')">复制</button></td>
+        <td><button class="copy-btn" onclick="copyURL('\${item.realKey}')">复制</button></td>
+        <td><button class="edit-btn" onclick="editItem('\${item.realKey}','\${encodeURIComponent(item.displayName)}','\${encodeURIComponent(item.content)}')">编辑</button></td>
+        <td><button class="delete-btn" onclick="deleteKey('\${item.realKey}')">删除</button></td>\`;
       tbody.appendChild(tr);
     });
     const pageDiv=document.getElementById("pagination"); pageDiv.innerHTML="";
@@ -280,31 +291,30 @@ async function saveData(){
   let days=parseInt(document.getElementById("days").value,10);
   if(isNaN(days)||days<0) days=0;
   if(!text){alert("请输入订阅内容"); return;}
+  const btn=document.getElementById("saveBtn"); btn.disabled=true;
+
   try{
-    const resp=await fetch("/save?key="+encodeURIComponent(displayName)+"&days="+encodeURIComponent(days),{method:"POST",body:text});
+    let resp;
+    if(currentEditingKey){
+      resp = await fetch("/update?key="+encodeURIComponent(currentEditingKey)+"&displayName="+encodeURIComponent(displayName)+"&days="+encodeURIComponent(days)+"&password="+encodeURIComponent(ADMIN_PASSWORD),{method:"POST",body:text});
+      currentEditingKey = null;
+      btn.textContent="保存订阅";
+    } else {
+      resp = await fetch("/save?key="+encodeURIComponent(displayName)+"&days="+encodeURIComponent(days),{method:"POST",body:text});
+    }
     alert(await resp.text());
     document.getElementById("key").value=""; document.getElementById("text").value=""; document.getElementById("days").value="";
     loadKeyList(currentPage);
   }catch(err){alert("保存失败:"+err.message);}
-}
-
-async function updateData(realKey){
-  const displayName=document.getElementById("key").value.trim()||"未命名";
-  const text=document.getElementById("text").value.trim();
-  let days=parseInt(document.getElementById("days").value,10);
-  if(isNaN(days)||days<0) days=0;
-  if(!text){alert("请输入订阅内容"); return;}
-  try{
-    const resp=await fetch("/update?key="+encodeURIComponent(realKey)+"&displayName="+encodeURIComponent(displayName)+"&days="+encodeURIComponent(days)+"&password="+encodeURIComponent(ADMIN_PASSWORD),{method:"POST",body:text});
-    alert(await resp.text());
-    document.getElementById("saveBtn").textContent="保存订阅"; loadKeyList(currentPage);
-  }catch(err){alert("更新失败:"+err.message);}
+  finally{btn.disabled=false;}
 }
 
 function editItem(realKey, displayName, content){
   document.getElementById("key").value=decodeURIComponent(displayName);
   document.getElementById("text").value=decodeURIComponent(content);
-  const btn=document.getElementById("saveBtn"); btn.textContent="更新订阅"; btn.onclick=()=>updateData(realKey);
+  currentEditingKey=realKey;
+  const btn=document.getElementById("saveBtn");
+  btn.textContent="更新订阅";
 }
 
 async function deleteKey(key){
@@ -318,14 +328,6 @@ async function deleteKey(key){
 async function copyText(text){if(!text)return; try{await navigator.clipboard.writeText(text);}catch(e){prompt("复制失败，请手动复制:",text);} alert("已复制!");}
 async function copyBase64(key){try{let resp=await fetch("/get/"+encodeURIComponent(key)); let base64=await resp.text(); await copyText(base64);}catch(err){alert("复制 Base64 失败:"+err.message);}}
 async function copyURL(key){try{let url=window.location.origin+"/get/"+encodeURIComponent(key); await copyText(url);}catch(err){alert("复制 URL 失败:"+err.message);}}
-
-document.getElementById("saveBtn").addEventListener("click", saveData);
-document.getElementById("searchBtn").addEventListener("click", ()=>{
-  currentSearch=document.getElementById("search").value.trim();
-  currentSort=document.getElementById("sort").value;
-  currentOrder=document.getElementById("order").value;
-  loadKeyList(1);
-});
 </script>
 </div>
 </body>
