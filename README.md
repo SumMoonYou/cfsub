@@ -1,9 +1,10 @@
 
-<img<img width="984" height="502" alt="截图20251113150114" src="https://github.com/user-attachments/assets/73adf4f5-2d68-4a48-8b89-16caaf1a7948" />
- width="971" height="684" alt="截图20251113150101" src="https://github.com/user-attachments/assets/d77775bc-28bb-47e2-a548-87bfd688d7c7" />
+<img width="984" height="502" alt="截图20251113150114" src="https://github.com/user-attachments/assets/73adf4f5-2d68-4a48-8b89-16caaf1a7948" />
+ <img width="971" height="684" alt="截图20251113150101" src="https://github.com/user-attachments/assets/d77775bc-28bb-47e2-a548-87bfd688d7c7" />
 
 
 1️⃣ 登录与管理
+
  • 管理员登录需要密码（ADMIN_PASSWORD）才能访问管理界面和执行更新/删除操作。
  • 添加新订阅无需密码。
  • 登录成功会触发 Telegram 通知，记录登录时间和管理员操作。
@@ -11,6 +12,7 @@
 ⸻
 
 2️⃣ 订阅管理
+
  • 添加订阅：
  • 输入显示名称（可选）、订阅内容、有效天数。
  • 系统生成随机的 realKey，实际访问订阅链接使用随机码。
@@ -25,6 +27,7 @@
 ⸻
 
 3️⃣ 访问订阅
+
  • 每个订阅有独立 URL：/get/{realKey}。
  • 访问时：
  • 返回订阅内容的 Base64 编码。
@@ -35,6 +38,7 @@
 ⸻
 
 4️⃣ KV 数据管理
+
  • 所有订阅保存在 Cloudflare KV。
  • 数据结构包含：
  • realKey（随机访问码）
@@ -46,6 +50,7 @@
 ⸻
 
 5️⃣ 搜索与分页
+
  • 搜索功能：
  • 输入搜索关键字，可按 displayName 过滤。
  • 搜索框为空时，显示全部订阅。
@@ -54,6 +59,7 @@
 ⸻
 
 6️⃣ 前端操作
+
  • 复制功能：
  • Base64 复制按钮
  • 订阅 URL 复制按钮
@@ -67,6 +73,7 @@
 ⸻
 
 7️⃣ Telegram 通知
+
  • 登录通知：管理员登录
  • 添加通知：新增订阅
  • 修改通知：更新订阅
@@ -77,6 +84,7 @@
 ⸻
 
 8️⃣ 安全与健壮性
+
  • 登录、更新、删除接口需要密码。
  • 添加和访问订阅无需密码，但访问订阅会通知管理员。
  • 自动处理订阅过期，不显示已过期内容。
