@@ -52,8 +52,9 @@ async function handleRequest(request) {
       if(!item || !item.content) return new Response("订阅数据异常",{status:500});
       if(item.expire && Date.now()>item.expire) return new Response("订阅已过期",{status:403});
 
-      const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "未知IP";
-      await sendTGNotificationAccess(item, ip);
+      // 获取客户端 IP + 设备信息
+      const { ip, ua } = getClientInfo(request);
+      await sendTGNotificationAccess(item, ip, ua);
 
       const base64 = btoa(item.content);
       return new Response(base64,{headers:{"Content-Type":"text/plain;charset=UTF-8"}});
@@ -131,11 +132,59 @@ async function handleRequest(request) {
 }
 
 // ---------------- 工具函数 ----------------
-function generateRandomKey(len=8){const chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';let s='';for(let i=0;i<len;i++) s+=chars.charAt(Math.floor(Math.random()*chars.length));return s;}
-async function sendTGNotification(message){try{const res=await fetch(`https://api.telegram.org/bot${EVA.TELEGRAM_BOT_TOKEN}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:EVA.TELEGRAM_CHAT_ID,text:message,parse_mode:"Markdown"})});const data=await res.json();if(!data.ok)console.error("TG通知失败:",data);}catch(e){console.error("TG fetch 异常:",e);}
+function generateRandomKey(len=8){
+  const chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let s='';
+  for(let i=0;i<len;i++) s+=chars.charAt(Math.floor(Math.random()*chars.length));
+  return s;
 }
-async function sendTGNotificationAdmin(item,action){const nameOrKey=(item && item.displayName)?item.displayName:(item && item.realKey)?item.realKey:action;const time=new Date().toLocaleString();const message=`📌 *订阅 ${action}*\n\n*订阅名称:* ${nameOrKey}\n*时间:* ${time}`;await sendTGNotification(message);}
-async function sendTGNotificationAccess(item,ip){const nameOrKey=(item && item.displayName)?item.displayName:(item && item.realKey)?item.realKey:"未知";const time=new Date().toLocaleString();const message=`📌 *订阅访问通知*\n\n*订阅名称:* ${nameOrKey}\n*访问 IP:* ${ip}\n*访问时间:* ${time}`;await sendTGNotification(message);}
+
+// 获取北京时间
+function getBeijingTime() {
+  const d = new Date();
+  d.setHours(d.getHours() + 8);
+  return d.toISOString().replace("T"," ").split(".")[0];
+}
+
+// 获取客户端 IP 和设备信息
+function getClientInfo(req) {
+  const ip = req.headers.get("cf-connecting-ip") || req.headers.get("x-forwarded-for") || "未知 IP";
+  const ua = req.headers.get("user-agent") || "未知设备";
+  return { ip, ua };
+}
+
+// 发送 TG 消息
+async function sendTGNotification(message){
+  try{
+    const res=await fetch(`https://api.telegram.org/bot${EVA.TELEGRAM_BOT_TOKEN}/sendMessage`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        chat_id:EVA.TELEGRAM_CHAT_ID,
+        text:message,
+        parse_mode:"Markdown"
+      })
+    });
+    const data=await res.json();
+    if(!data.ok) console.error("TG通知失败:",data);
+  }catch(e){ console.error("TG fetch 异常:",e); }
+}
+
+// 管理员操作通知
+async function sendTGNotificationAdmin(item,action){
+  const nameOrKey = (item && item.displayName) ? item.displayName : (item && item.realKey) ? item.realKey : action;
+  const time = getBeijingTime();
+  const message = `📌 *订阅 ${action}*\n\n*订阅名称:* ${nameOrKey}\n*时间（北京）:* ${time}`;
+  await sendTGNotification(message);
+}
+
+// 访问通知（包含 IP + 设备信息）
+async function sendTGNotificationAccess(item, ip, ua){
+  const nameOrKey = (item && item.displayName) ? item.displayName : (item && item.realKey) ? item.realKey : "未知订阅";
+  const time = getBeijingTime();
+  const message = `📌 *订阅访问通知*\n\n*订阅名称:* ${nameOrKey}\n*访问 IP:* ${ip}\n*设备信息:* ${ua}\n*访问时间（北京）:* ${time}`;
+  await sendTGNotification(message);
+}
 
 // ---------------- 前端 HTML ----------------
 function generateHTML(){
