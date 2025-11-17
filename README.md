@@ -1,85 +1,17 @@
+# 部署于cloudflare的节点订阅工具
 
-<img width="984" height="502" alt="截图20251113150114" src="https://github.com/user-attachments/assets/73adf4f5-2d68-4a48-8b89-16caaf1a7948" />
-<img width="971" height="684" alt="截图20251113150101" src="https://github.com/user-attachments/assets/d77775bc-28bb-47e2-a548-87bfd688d7c7" />
+✅ 使用说明
+- 创建一个Workers
+- 绑定一个KV 命名空间，名称为NODES_KV
+- 添加环境变量
+  ADMIN_PASSWORD     登录密码
+  DEFAULT_EXPIRE_DAYS     默认过期时间
+  PAGE_SIZE     订单列表分页数量
+  TELEGRAM_BOT_TOKEN     tg机器人API
+  TELEGRAM_CHAT_ID     tg账号id
 
-
-1️⃣ 登录与管理
-
-- 管理员登录需要密码（ADMIN_PASSWORD）才能访问管理界面和执行更新/删除操作。
--  添加新订阅无需密码。
--  登录成功会触发 Telegram 通知，记录登录时间和管理员操作。
-
-
-
-2️⃣ 订阅管理
-
-1.  添加订阅：
-   1. 输入显示名称（可选）、订阅内容、有效天数。
-   2. 系统生成随机的 realKey，实际访问订阅链接使用随机码。
-   3. 添加成功会发送 Telegram 通知，显示 displayName 或 realKey。
-2. 编辑订阅：
-   1. 可以修改显示名称、内容、有效天数。
-3. 修改成功会发送 Telegram 通知。
-4. 删除订阅：
-   1. 可以删除已保存的订阅。
-   2. 删除成功会发送 Telegram 通知。
-
-3️⃣ 访问订阅
-
-1.  每个订阅有独立 URL：/get/{realKey}。
-2. 访问时：
-   1. 返回订阅内容的 Base64 编码。
-   2. 自动触发 Telegram 通知：
-   3. 显示 displayName（如果有），否则显示 realKey。
-   4. 会检测有效期，过期订阅无法访问。
-
-
-
-4️⃣ KV 数据管理
-
-1.  • 所有订阅保存在 Cloudflare KV。
-    • 数据结构包含：
-    • realKey（随机访问码）
-    • displayName（显示名称）
-    • content（订阅内容）
-    • expire（过期时间，单位毫秒）
-    • 支持永久订阅（输入天数为 0）。
-
-
-
-5️⃣ 搜索与分页
-
-1.  搜索功能：
-2. 输入搜索关键字，可按 displayName 过滤。
-3.  搜索框为空时，显示全部订阅。
-4. 支持分页显示，每页默认 10 条，可修改 PAGE_SIZE。
-
-
-
-6️⃣ 前端操作
-
-1. 复制功能：
-   1. Base64 复制按钮
-   2. 订阅 URL 复制按钮
-2. 编辑、删除按钮：
-   1. 对应每条订阅，直接在表格操作。
-3. 表格显示：
-   1. 显示名称、剩余天数、操作按钮（复制、编辑、删除）
-4. 排序功能：
-   1. 可按名称或剩余天数升序/降序排序。
-
-7️⃣ Telegram 通知
-
-1.  登录通知：管理员登录
-2. 添加通知：新增订阅
-3. 修改通知：更新订阅
-4. 删除通知：删除订阅
-5. 访问通知：有人访问订阅
-6. 显示 displayName，没有显示 realKey
-
-8️⃣ 安全与健壮性
-
-1.  登录、更新、删除接口需要密码。
-2.  添加和访问订阅无需密码，但访问订阅会通知管理员。
-3.  自动处理订阅过期，不显示已过期内容。
-4.  KV 读取异常处理，避免 null 或 expire 报错。
+✅ 页面预览
+- 登录页面
+  <img width="1920" height="919" alt="image" src="https://github.com/user-attachments/assets/93ba55a1-ef9b-4ff0-88f1-2ddb64ad68c9" />
+- 后台页面
+  <img width="1920" height="919" alt="image" src="https://github.com/user-attachments/assets/49ed4007-97af-4842-8e02-f52cbdf0ad86" />
