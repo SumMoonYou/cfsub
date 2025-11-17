@@ -4,11 +4,11 @@
 - 创建一个Workers
 - 绑定一个KV 命名空间，名称为NODES_KV
 - 添加环境变量
-  ADMIN_PASSWORD     登录密码
-  DEFAULT_EXPIRE_DAYS     默认过期时间
-  PAGE_SIZE     订单列表分页数量
-  TELEGRAM_BOT_TOKEN     tg机器人API
-  TELEGRAM_CHAT_ID     tg账号id
+- ADMIN_PASSWORD     登录密码
+- DEFAULT_EXPIRE_DAYS     默认过期时间
+- PAGE_SIZE     订单列表分页数量
+- TELEGRAM_BOT_TOKEN     tg机器人API
+- TELEGRAM_CHAT_ID     tg账号id
 
 ✅ 页面预览
 - 登录页面
