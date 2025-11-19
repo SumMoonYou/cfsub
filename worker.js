@@ -153,14 +153,32 @@ async function sendTGNotificationUnified(env, item, action, req) {
     const name = item?.displayName || item?.realKey || "未知订阅";
     const note = item?.note ? `\n*备注:* ${item.note}` : "";
     const time = getBeijingTime();
+    // 默认
     let ip = "未知 IP";
     let ua = "未知设备";
+
+    // 获取访问者信息
     if (req) {
       const info = getClientInfo(req);
-      ip = info.ip;
-      ua = info.ua;
+      ip = info.ip || "未知 IP";
+      ua = info.ua || "未知设备";
     }
-    const message = `📌 *订阅${action}通知*\n\n*订阅名称:* ${name}${note}\n*时间（北京）:* ${time}\n*访问 IP:* ${ip}\n*设备信息:* ${ua}`;
+
+    // ---- 动态拼接通知内容 ----
+    let msg = [];
+    msg.push(`📌 *订阅${escapeMDV2(action)}通知*`);
+    msg.push("");
+    msg.push(`📄 *订阅名称:* ${name}${note}`);
+    msg.push(`🕒 *时间（北京）:* ${time}`);
+
+    if (ip !== "未知 IP") {
+      msg.push(`🌐 *访问 IP:* ${escapeMDV2(ip)}`);
+    }
+    if (ua !== "未知设备") {
+      msg.push(`📱 *设备信息:* ${escapeMDV2(ua)}`);
+    }
+
+    const message = msg.join("\n");
     await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -168,6 +186,11 @@ async function sendTGNotificationUnified(env, item, action, req) {
     });
   } catch (e) { console.error("TG通知异常:", e); }
 }
+
+async function escapeMDV2(text = "") {
+  return text.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
+}
+
 
 async function sendTGNotificationAdmin(env, item, action) {
   await sendTGNotificationUnified(env, item, action, null);
