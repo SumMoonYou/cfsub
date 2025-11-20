@@ -146,51 +146,17 @@ function getClientInfo(req) {
   return { ip, ua };
 }
 
-// -------------------- TG 通知 --------------------
-async function sendTGNotificationUnified(env, item, action, req) {
-  try {
-    if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
-    const name = item?.displayName || item?.realKey || "未知订阅";
-    const note = item?.note ? `\n*备注:* ${item.note}` : "";
-    const time = getBeijingTime();
-    // 默认
-    let ip = "未知 IP";
-    let ua = "未知设备";
-
-    // 获取访问者信息
-    if (req) {
-      const info = getClientInfo(req);
-      ip = info.ip || "未知 IP";
-      ua = info.ua || "未知设备";
-    }
-
-    // ---- 动态拼接通知内容 ----
-    let msg = [];
-    msg.push(`📌 *订阅${escapeMDV2(action)}通知*`);
-    msg.push("");
-    msg.push(`📄 *订阅名称:* ${name}${note}`);
-    msg.push(`🕒 *时间（北京）:* ${time}`);
-
-    if (ip !== "未知 IP") {
-      msg.push(`🌐 *访问 IP:* ${escapeMDV2(ip)}`);
-    }
-    if (ua !== "未知设备") {
-      msg.push(`📱 *设备信息:* ${escapeMDV2(ua)}`);
-    }
-
-    const message = msg.join("\n");
-    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: message, parse_mode: "Markdown" })
-    });
-  } catch (e) { console.error("TG通知异常:", e); }
-}
+  // -------------------- TG 通知 --------------------
+  async function sendTGNotificationUnified(env, item, action, req) {
+…	  });
+	} catch (e) {
+	  console.error("TG通知异常:", e);
+	}
+  }
 
 async function escapeMDV2(text = "") {
   return text.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
 }
-
 
 async function sendTGNotificationAdmin(env, item, action) {
   await sendTGNotificationUnified(env, item, action, null);
@@ -342,8 +308,8 @@ async function deleteKey(key){
 }
 
 async function copyText(text){if(!text)return; try{await navigator.clipboard.writeText(text);}catch(e){prompt("复制失败，请手动复制:",text);} alert("已复制!");}
-async function copyBase64(key){try{let resp=await fetch("/get/"+encodeURIComponent(key)); let base64=await resp.text(); await copyText(base64);}catch(err){alert("复制 Base64 失败:"+err.message);}}
-async function copyURL(key){try{let url=window.location.origin+"/get/"+encodeURIComponent(key); await copyText(url);}catch(err){alert("复制 URL 失败:"+err.message);}}
+async function copyBase64(key){try{let resp=await fetch("/get/"+encodeURIComponent(key)); let base64=await resp.text(); await copyText(base64);}catch(err){alert("复制 Base64 失败:"+err.message);} }
+async function copyURL(key){try{let url=window.location.origin+"/get/"+encodeURIComponent(key); await copyText(url);}catch(err){alert("复制 URL 失败:"+err.message);} }
 </script>
 </div></body></html>`;
 }
