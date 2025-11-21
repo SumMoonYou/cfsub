@@ -15,7 +15,8 @@ async function handleRequest(request, env) {
     if (path === "/login") {
       const pw = url.searchParams.get("password");
       if (pw === env.ADMIN_PASSWORD) {
-        await sendTGNotificationAdmin(env, { displayName: "管理员" }, "登录");
+        // 管理员登录：无法获取真实归属地，传入 null
+        await sendTGNotificationAdmin(env, { displayName: "管理员" }, "登录", null); 
         return new Response("登录成功", { status: 200 });
       } else return new Response("密码错误", { status: 403 });
     }
@@ -32,8 +33,9 @@ async function handleRequest(request, env) {
       const realKey = generateRandomKey(8);
       const expire = days > 0 ? Date.now() + days * 24 * 60 * 60 * 1000 : null;
       const item = { realKey, displayName, content, expire, note };
+      // 管理员操作：无法获取真实归属地，传入 null
       await kv.put(realKey, JSON.stringify(item));
-      await sendTGNotificationAdmin(env, item, "新增");
+      await sendTGNotificationAdmin(env, item, "新增", null);
 
       return new Response(`订阅 "${displayName}" 保存成功，访问 URL: /get/${realKey}`, { headers: { "Content-Type": "text/plain" } });
     }
@@ -49,7 +51,13 @@ async function handleRequest(request, env) {
       if (item.expire && Date.now() > item.expire) return new Response("订阅已过期", { status: 403 });
 
       const { ip, ua } = getClientInfo(request);
-      await sendTGNotificationAccess(env, item, ip, ua);
+      
+      // 使用 Cloudflare 原生地理信息
+      const country = request.cf?.country || "未知国家";
+      const city = request.cf?.city || "";
+      const cfLocation = city ? `${country}, ${city}` : country;
+
+      await sendTGNotificationAccess(env, item, ip, ua, cfLocation);
 
       const base64 = btoa(item.content);
       return new Response(base64, { headers: { "Content-Type": "text/plain;charset=UTF-8" } });
@@ -75,7 +83,8 @@ async function handleRequest(request, env) {
         const expire = days > 0 ? Date.now() + days * 24 * 60 * 60 * 1000 : oldItem.expire;
         const item = { realKey, displayName, content, expire, note };
         await kv.put(realKey, JSON.stringify(item));
-        await sendTGNotificationAdmin(env, item, "更新");
+        // 管理员操作：无法获取真实归属地，传入 null
+        await sendTGNotificationAdmin(env, item, "更新", null); 
         return new Response("订阅更新成功", { headers: { "Content-Type": "text/plain" } });
       }
 
@@ -86,7 +95,8 @@ async function handleRequest(request, env) {
         let oldItem = null;
         if (oldValue) { try { oldItem = JSON.parse(oldValue); } catch (e) { oldItem = null; } }
         await kv.delete(key);
-        await sendTGNotificationAdmin(env, { displayName: oldItem?.displayName, realKey: key, note: oldItem?.note }, "删除");
+        // 管理员操作：无法获取真实归属地，传入 null
+        await sendTGNotificationAdmin(env, { displayName: oldItem?.displayName, realKey: key, note: oldItem?.note }, "删除", null); 
         return new Response("删除成功", { headers: { "Content-Type": "text/plain" } });
       }
 
@@ -140,31 +150,144 @@ function getBeijingTime() {
   return d.toISOString().replace("T", " ").split(".")[0];
 }
 
+/**
+ * 增加获取 IPv4/IPv6 逻辑，优先获取 IPv4。
+ * @param {Request} req
+ * @returns {{ip: {v4: string|null, v6: string|null, main: string}, ua: string}}
+ */
 function getClientInfo(req) {
-  const ip = req.headers.get("cf-connecting-ip") || req.headers.get("x-forwarded-for") || "未知 IP";
+  const mainIP = req.headers.get("cf-connecting-ip") || req.headers.get("x-forwarded-for") || "未知 IP";
   const ua = req.headers.get("user-agent") || "未知设备";
-  return { ip, ua };
-}
 
-  // -------------------- TG 通知 --------------------
-  async function sendTGNotificationUnified(env, item, action, req) {
-…	  });
-	} catch (e) {
-	  console.error("TG通知异常:", e);
-	}
+  let ipv4 = null;
+  let ipv6 = null;
+
+  // 简单的判断 IP 类型
+  const isIPv4 = (ip) => /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip);
+
+  if (isIPv4(mainIP)) {
+    ipv4 = mainIP;
+  } else if (mainIP.includes(':')) {
+    ipv6 = mainIP;
   }
 
-async function escapeMDV2(text = "") {
+  // 尝试从 X-Forwarded-For 获取 IPv4 地址 (在启用 Pseudo IPv4 时可能有用)
+  const xff = req.headers.get("x-forwarded-for");
+  if (xff) {
+    const xffIPs = xff.split(',').map(s => s.trim());
+    for (const ip of xffIPs) {
+      if (isIPv4(ip) && ip !== ipv4) {
+        ipv4 = ipv4 || ip;
+        break;
+      }
+    }
+  }
+
+  const actualMainIP = ipv4 || ipv6 || mainIP;
+
+  return { ip: { v4: ipv4, v6: ipv6, main: actualMainIP }, ua };
+}
+
+// -------------------- TG 通知 --------------------
+
+/**
+ * 【美化】使用新的 MarkdownV2 模板。
+ * @param {*} env 
+ * @param {*} item 
+ * @param {*} action 
+ * @param {*} req 
+ * @param {string|null} location - Cloudflare 提供的地理位置信息 (例如 "US, New York")
+ */
+async function sendTGNotificationUnified(env, item, action, req, location) {
+  try {
+    if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+    const name = item?.displayName || item?.realKey || "未知订阅";
+    const note = item?.note ? `\n*备注:* ${item.note}` : "";
+    const time = getBeijingTime();
+    
+    let clientIPInfo = { v4: null, v6: null, main: "未知 IP" };
+    let ua = "未知设备";
+
+    if (req) {
+      const info = getClientInfo(req);
+      clientIPInfo = info.ip;
+      ua = info.ua || "未知设备";
+    }
+    
+    // 使用传入的 location 或默认值
+    const displayLocation = location || "未知归属地";
+
+    // ---- 动态拼接通知内容 (美化模板) ----
+    let msg = [];
+    
+    // 对 action 进行转义 (确保安全)
+    const escapedAction = escapeMDV2(action); 
+    
+    // 标题
+    msg.push(`⭐ *${escapedAction} 订阅通知* ⭐`);
+    msg.push("");
+    
+    // 订阅信息
+    // 使用 `code` 块格式化名称和归属地
+    msg.push(`📄 *名称:* \`${name}\`${note}`);
+    msg.push(`📍 *地区:* \`${displayLocation}\``);
+    
+    msg.push("");
+
+    // IP 地址（使用 code 块格式化）
+    if (clientIPInfo.v4) {
+      msg.push(`💻 *IP (v4):* \`${clientIPInfo.v4}\``);
+      if (clientIPInfo.v6 && clientIPInfo.v6 !== clientIPInfo.v4) {
+        msg.push(`🌐 *IP (v6):* \`${clientIPInfo.v6}\``);
+      }
+    } else if (clientIPInfo.v6) {
+      msg.push(`🌐 *IP (v6):* \`${clientIPInfo.v6}\``);
+    } else if (clientIPInfo.main !== "未知 IP") {
+       msg.push(`🌐 *IP:* \`${clientIPInfo.main}\``);
+    }
+    
+    // 设备信息
+    if (ua !== "未知设备") {
+      // 使用 code 块格式化设备信息
+      msg.push(`📱 *设备:* \`${ua}\``);
+    }
+    
+    msg.push("");
+
+    // 时间
+    // 使用 code 块格式化时间
+    msg.push(`⏰ *时间:* \`${time}\` (北京)`);
+
+    const message = msg.join("\n");
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: message, parse_mode: "Markdown" })
+    });
+  } catch (e) { console.error("TG通知异常:", e); }
+}
+
+// 保持 escapeMDV2 为同步函数
+function escapeMDV2(text = "") {
   return text.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
 }
 
-async function sendTGNotificationAdmin(env, item, action) {
-  await sendTGNotificationUnified(env, item, action, null);
+/**
+ * 管理员通知的辅助函数。由于没有真实请求，location 传入 null。
+ */
+async function sendTGNotificationAdmin(env, item, action, location) {
+  await sendTGNotificationUnified(env, item, action, { headers: new Map() }, location); 
 }
 
-async function sendTGNotificationAccess(env, item, ip, ua) {
-  const fakeReq = { headers: new Map([["cf-connecting-ip", ip], ["user-agent", ua]]) };
-  await sendTGNotificationUnified(env, item, "访问", fakeReq);
+/**
+ * 访问通知的辅助函数。
+ */
+async function sendTGNotificationAccess(env, item, ip, ua, location) {
+  // 这里的 ip 和 ua 已经是 getClientInfo 提取后的结果，
+  // 但 sendTGNotificationUnified 还需要 request 对象来运行 getClientInfo，
+  // 这里传入一个包含主要 IP 和 UA 的模拟 Request 对象。
+  const fakeReq = { headers: new Map([["cf-connecting-ip", ip.main || "未知 IP"], ["user-agent", ua]]) };
+  await sendTGNotificationUnified(env, item, "访问", fakeReq, location);
 }
 
 // -------------------- 前端 HTML --------------------
@@ -308,8 +431,8 @@ async function deleteKey(key){
 }
 
 async function copyText(text){if(!text)return; try{await navigator.clipboard.writeText(text);}catch(e){prompt("复制失败，请手动复制:",text);} alert("已复制!");}
-async function copyBase64(key){try{let resp=await fetch("/get/"+encodeURIComponent(key)); let base64=await resp.text(); await copyText(base64);}catch(err){alert("复制 Base64 失败:"+err.message);} }
-async function copyURL(key){try{let url=window.location.origin+"/get/"+encodeURIComponent(key); await copyText(url);}catch(err){alert("复制 URL 失败:"+err.message);} }
+async function copyBase64(key){try{let resp=await fetch("/get/"+encodeURIComponent(key)); let base64=await resp.text(); await copyText(base64);}catch(err){alert("复制 Base64 失败:"+err.message);}}
+async function copyURL(key){try{let url=window.location.origin+"/get/"+encodeURIComponent(key); await copyText(url);}catch(err){alert("复制 URL 失败:"+err.message);}}
 </script>
 </div></body></html>`;
 }
