@@ -1,164 +1,199 @@
-# CFSub — Cloudflare Workers 订阅管理系统
+# KV Subscription Manager (Cloudflare Workers)
 
-CFSub 是一个基于 **Cloudflare Workers + KV** 的轻量级订阅管理后台，用于创建、分发、更新及管理 Clash / Shadowrocket 等代理订阅。
+一个基于 **Cloudflare Workers + KV** 的轻量级订阅管理系统，支持在线保存、更新、删除订阅内容，并提供访问日志与管理员 Telegram 通知功能。
 
-本项目特点：
+本项目适用于管理代理订阅（如 Clash / V2Ray / Sing-Box）、分享节点、或管理任何需要按 Key 提供内容的场景。
 
-* 🎯 纯前后端一体，仅需 Cloudflare Worker 即可运行
-* 📦 支持自动生成订阅链接（唯一 realKey）
-* ⏳ 自带订阅过期管理
-* 📝 支持备注（note）与创建时间（createdAt）
-* 🔐 管理员密码控制 + Telegram 通知
-* 🔍 支持搜索、排序、列表查看
+------
 
----
+## ✨ 功能特性
 
-## 🚀 功能列表
+### 🔐 管理后台
 
-### 用户侧
+- 管理端自带网页 UI（无需额外后端）
+- 密码登录
+- 在线创建 / 更新 / 删除订阅
+- 搜索、排序（名称/剩余天数）
+- 分页显示
+- 可直接复制订阅 URL 与 Base64 内容
+- 备注功能
 
-* 通过唯一订阅 Key (`/get/<realKey>`) 拉取订阅内容
-* 错误或过期自动拒绝访问
+### 📦 订阅数据
 
-### 管理侧
+- 每个订阅自动生成随机 `realKey`
+- 支持设置有效期（0 = 永久）
+- 支持备注 `note`
+- 支持记录创建时间（自动）
 
-| 路径                    | 功能     | 说明                                       |
-| --------------------- | ------ | ---------------------------------------- |
-| `/login?password=xxx` | 登录验证   | 正确密码将触发 Telegram 通知                      |
-| `/save`               | 新增订阅   | 自动生成 realKey；支持 note 与 createdAt         |
-| `/update`             | 更新订阅   | 修改 displayName / expire / note / content |
-| `/delete`             | 删除订阅   | 删除 KV 项，通知中不再包含 note                     |
-| `/list`               | 列出所有订阅 | 支持分页、搜索、排序                               |
+### 📡 访问追踪
 
----
+当订阅被访问时自动记录：
 
-## 📦 环境变量（Environment Bindings）
+- IPv4 / IPv6
+- User-Agent
+- 国家/地区（Cloudflare 提供）
+- 访问时间
 
-在 Cloudflare Worker Dashboard → Settings → Variables 中配置：
+并自动发送 Telegram 通知。
 
-| 变量名               | 说明                        |
-| ----------------- | ------------------------- |
-| `ADMIN_PASSWORD`  | 管理密码                      |
-| `BOT_TOKEN_ADMIN` | Telegram Bot Token        |
-| `CHAT_ID_ADMIN`   | Telegram 管理员接收通知的 chat_id |
-| `SUBSCRIPTIONS`   | 绑定的 Workers KV 命名空间名称     |
+### 📩 Telegram 通知
 
----
+支持两类通知：
 
-## 📡 API 说明
+- **新增 / 更新 / 删除** 管理动作通知
+- **用户访问订阅** 通知
 
-### 1. 新增订阅 `/save`
+采用 Telegram **MarkdownV2 安全格式**，无消息解析错误。
 
-**方法：POST**
+------
 
-#### Body JSON
+## 🚀 部署方法
 
-```json
-{
-  "key": "展示名称可选",
-  "days": 30,
-  "content": "订阅原始内容",
-  "note": "备注，可选"
-}
+### 1. 创建 Cloudflare Worker
+
+在 Cloudflare Dash → Workers → Create → 粘贴本仓库 `worker.js` 全部内容。
+
+------
+
+### 2. 创建 KV Namespace
+
+Dash → Workers → KV → Create namespace，名称如：
+
+```
+NODES_KV
 ```
 
-#### 返回示例
+绑定到 Worker 的 KV，变量名同样设置为：
 
-```json
-{
-  "success": true,
-  "realKey": "A1B2C3D4E5",
-  "expire": 1737456930000
-}
+```
+NODES_KV
 ```
 
-📌 **新增功能：保存时会自动添加字段：**
+------
 
-```json
-"createdAt": "2025-01-01T12:00:00.000Z"
+### 3. 设置环境变量
+
+Worker → Settings → Variables → Add
+
+| 变量名               | 说明                |
+| -------------------- | ------------------- |
+| `ADMIN_PASSWORD`     | 管理后台密码        |
+| `TELEGRAM_BOT_TOKEN` | 你的 Bot Token      |
+| `TELEGRAM_CHAT_ID`   | 接收通知的 chat_id  |
+| `NODES_KV`           | KV 名称（自动生成） |
+
+------
+
+## 🖥 管理界面
+
+部署后直接访问 Worker URL 会自动加载管理后台：
+
+```
+https://your-worker-domain.workers.dev/
 ```
 
----
+输入管理员密码即可使用。
 
-### 2. 获取订阅 `/get/<realKey>`
+界面功能包括：
 
-返回 Base64 编码的订阅内容，过期则返回错误。
+- 创建订阅
+- 设置有效期
+- 添加备注
+- 编辑更新
+- 删除订阅
+- 搜索、排序
+- 复制 Base64
+- 复制订阅 URL
 
----
+------
 
-### 3. 更新订阅 `/update?password=xxx`
+## 📘 API 说明
 
-**方法：POST**
+### 登录
 
-可更新 `displayName`, `days`, `note`, `content`。
-
----
-
-### 4. 删除订阅 `/delete?password=xxx&key=<realKey>`
-
-删除 KV 中的订阅。
-
-📌 **新增行为：删除通知中已移除 note 字段。**
-
----
-
-### 5. 订阅列表 `/list?password=xxx`
-
-支持：
-
-* 按显示名搜索
-* 按创建时间排序（若启用 createdAt）
-* 展示剩余天数、内容、备注等
-
----
-
-## 🧩 KV 存储结构
-
-每个订阅以 `realKey` 作为键，值为：
-
-```json
-{
-  "realKey": "A1B2C3D4E5",
-  "displayName": "用户A",
-  "content": "原始订阅内容",
-  "expire": 1737456930000,
-  "note": "测试",
-  "createdAt": "2025-01-01T12:00:00.000Z"
-}
+```
+GET /login?password=ADMIN_PASSWORD
 ```
 
----
+### 新增订阅
 
-## 🛠 部署方法
-
-### 1. 克隆仓库
-
-```bash
-git clone https://github.com/SumMoonYou/cfsub.git
+```
+POST /save?key=名称&days=天数&note=备注
+Body = 订阅内容
 ```
 
-### 2. 进入目录
+返回生成的 `realKey`。
 
-```bash
-cd cfsub
+### 获取订阅 Base64
+
+```
+GET /get/realKey
 ```
 
-### 3. 使用 Wrangler 部署
+返回 Base64 内容。
 
-```bash
-wrangler publish
+### 更新订阅
+
+```
+POST /update?key=realKey&displayName=名称&days=天数&note=备注&password=ADMIN_PASSWORD
+Body = 新内容
 ```
 
-配置好 KV 与环境变量即可使用。
+### 删除订阅
 
----
+```
+POST /delete?key=realKey&password=ADMIN_PASSWORD
+```
 
-## 📬 Telegram 通知
+### 列表查询
 
-系统所有关键操作均会发送至管理员：
+```
+GET /list?page=1&search=&sort=displayName&order=asc&password=ADMIN_PASSWORD
+```
 
-* 登录成功
-* 新建订阅
-* 更新订阅
-* 删除订阅（不含 note）
-* 用户订阅访问
+------
+
+## 📬 Telegram 通知示例
+
+### 管理类通知（新增/更新/删除）
+
+```
+🟢 新增订阅
+⏰ 时间：2025-12-10 10:00:00
+
+📛 名称: 我的节点
+🔑 Key: Abc123Xy
+📅 过期时间: 2025-12-20 00:00:00
+📅 剩余天数: 10
+📝 备注: 家宽节点
+```
+
+### 用户访问通知
+
+```
+🧭 订阅被访问
+时间：2025-12-10 11:03:21
+
+📛 订阅: 我的节点
+🔑 Key: Abc123Xy
+📍 地区: SG, Singapore
+🌐 IPv4: 1.2.3.4
+💻 设备: ClashMeta/Windows
+```
+
+------
+
+## 🧩 技术说明
+
+- 使用 `Cloudflare Workers` 作为后端与管理界面渲染
+- 数据存储在 KV
+- 所有订阅内容存储为 JSON
+- Base64 输出用于兼容 Clash / V2Ray 等订阅格式
+- Telegram 采用 `MarkdownV2` 安全转义，避免解析失败
+- 地理位置来自 Cloudflare Edge（无需额外 API）
+
+------
+
+## 📄 LICENSE
+
+MIT License
