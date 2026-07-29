@@ -1,182 +1,235 @@
 export default {
   async fetch(request, env) {
-    return handleRequest(request, env);
-  }
-};
+    try {
+      const url = new URL(request.url);
+      const path = url.pathname;
+      const kv = env.NODES_KV;
 
-// ================== 主路由 ==================
-async function handleRequest(request, env) {
-  try {
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const kv = env.NODES_KV;
-
-    // ========== 登录 ==========
-    if (path === "/login") {
-      const pw = url.searchParams.get("password");
-      if (pw === env.ADMIN_PASSWORD) {
-        await sendTGNotificationAdmin(env, { displayName: "管理员" }, "登录", null);
-        return new Response("登录成功", { status: 200 });
+      // ========== 基础路由过滤 ==========
+      const allowedPaths = ["/", "/login", "/save", "/update", "/delete", "/list", "/detail"];
+      if (!allowedPaths.includes(path) && !path.startsWith("/get/")) {
+        return new Response("Not Found", { status: 404 });
       }
-      return new Response("密码错误", { status: 403 });
-    }
+      if (!kv) return new Response("未绑定 NODES_KV", { status: 500 });
 
-    // ========== 保存 ==========
-    if (path === "/save") {
-      const displayName = url.searchParams.get("key") || "未命名";
-      let days = parseInt(url.searchParams.get("days"), 10);
-      if (isNaN(days) || days < 0) days = 7;
+      // ========== 获取访客信息 ==========
+      const ua = request.headers.get("user-agent") || "未知设备";
+      const ip = (request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "未知IP").split(",")[0].trim();
+      const cfLocation = request.cf?.city ? `${request.cf.country}, ${request.cf.city}` : (request.cf?.country || "未知国家");
 
-      const content = await request.text();
-      if (!content) return new Response("未提供订阅内容", { status: 400 });
-
-      const note = url.searchParams.get("note") || "";
-      const realKey = generateRandomKey(8);
-      const expire = days > 0 ? Date.now() + days * 86400000 : null;
-
-      const item = { realKey, displayName, content, expire, note };
-
-      await kv.put(realKey, JSON.stringify(item));
-      await sendTGNotificationAdmin(env, item, "新增", null);
-
-      return new Response(
-        `订阅 "${displayName}" 保存成功，访问 URL: /get/${realKey}`,
-        { headers: { "Content-Type": "text/plain; charset=UTF-8" } }
-      );
-    }
-
-    // ========== 获取订阅 Base64 ==========
-    if (path.startsWith("/get/")) {
-      const realKey = path.replace("/get/", "");
-      const value = await kv.get(realKey);
-      if (!value) return new Response("订阅不存在", { status: 404 });
-
-      let item;
-      try { item = JSON.parse(value); } catch { return new Response("订阅数据异常", { status: 500 }); }
-
-      if (item.expire && Date.now() > item.expire)
-        return new Response("订阅已过期", { status: 403 });
-
-      const { ip, ua } = getClientInfo(request);
-
-      const country = request.cf?.country || "未知国家";
-      const city = request.cf?.city || "";
-      const cfLocation = city ? `${country}, ${city}` : country;
-
-      await sendTGNotificationAccess(env, item, ip, ua, cfLocation);
-
-      const base64 = btoa(item.content);
-      return new Response(base64, { headers: { "Content-Type": "text/plain; charset=UTF-8" } });
-    }
-
-    // ========== 管理操作 ==========
-    if (["/update", "/delete", "/list"].includes(path)) {
-      const pw = url.searchParams.get("password");
-      if (pw !== env.ADMIN_PASSWORD) return new Response("密码错误", { status: 403 });
-
-      // === 更新 ===
-      if (path === "/update") {
-        const realKey = url.searchParams.get("key");
-        if (!realKey) return new Response("缺少 key", { status: 400 });
-
-        const content = await request.text();
-        if (!content) return new Response("缺少内容", { status: 400 });
-
-        const displayName = url.searchParams.get("displayName") || "未命名";
-        const note = url.searchParams.get("note") || "";
-
-        let days = parseInt(url.searchParams.get("days"), 10);
-        if (isNaN(days) || days < 0) days = 0;
-
-        const oldValue = await kv.get(realKey);
-        if (!oldValue) return new Response("订阅不存在", { status: 404 });
-
-        let old;
-        try { old = JSON.parse(oldValue); } catch { return new Response("数据异常", { status: 500 }); }
-
-        const expire = days > 0 ? Date.now() + days * 86400000 : old.expire;
-
-        const item = { realKey, displayName, content, expire, note };
-        await kv.put(realKey, JSON.stringify(item));
-
-        await sendTGNotificationAdmin(env, item, "更新", null);
-
-        return new Response("订阅更新成功", {
+      // ========== 🌏 地区限制：仅允许中国大陆 ==========
+      if (request.cf?.country !== "CN") {
+        return new Response("当前区域不支持访问", {
+          status: 403,
           headers: { "Content-Type": "text/plain; charset=UTF-8" }
         });
       }
-      // === 删除 ===
-      if (path === "/delete") {
-        const key = url.searchParams.get("key");
-        if (!key) return new Response("缺少 key", { status: 400 });
 
-        const oldValue = await kv.get(key);
-        let oldItem = null;
-        if (oldValue) {
-          try { oldItem = JSON.parse(oldValue); } catch (e) { oldItem = null; }
+      // ========== 🧭 订阅获取接口 ==========
+      if (path.startsWith("/get/")) {
+        const realKey = path.replace("/get/", "");
+        if (!realKey) return new Response("缺少 Key", { status: 400 });
+
+        // 客户端 UA 白名单
+        const uaWhitelist = [
+          "clash",
+          "quantumult",
+          "surge",
+          "shadowrocket",
+          "v2ray",
+          "sing-box",
+          "loon",
+          "v2rayng",
+          "nekobox",
+          "tbox",
+          "passwall"
+        ];
+
+        if (!uaWhitelist.some(k => ua.toLowerCase().includes(k))) {
+          return new Response("未授权的客户端类型", { status: 403 });
         }
 
-        await kv.delete(key);
-        await sendTGNotificationAdmin(env, { displayName: oldItem?.displayName, realKey: key, note: oldItem?.note }, "删除", null);
+        const value = await kv.get(realKey);
+        if (!value) {
+          await sendTG(env, "⚠️ 订阅访问失败", {
+            "原因": "订阅不存在",
+            "Key": realKey,
+            "位置": cfLocation,
+            "IP": ip
+          });
+          return new Response("订阅不存在", { status: 404 });
+        }
 
-        return new Response("删除成功", { headers: { "Content-Type": "text/plain; charset=UTF-8" } });
+        const item = JSON.parse(value);
+
+        // 检查过期
+        if (item.expire && Date.now() > item.expire) {
+          await sendTG(env, "⏳ 订阅已过期", {
+            "名称": item.displayName,
+            "Key": item.realKey,
+            "位置": cfLocation
+          });
+          return new Response("订阅已过期", { status: 403 });
+        }
+
+        await sendTG(env, "🧭 订阅节点访问", {
+          "名称": item.displayName,
+          "Key": item.realKey,
+          "位置": cfLocation,
+          "IP": ip,
+          "UA": ua
+        });
+
+        return new Response(safeBtoa(item.content), {
+          headers: {
+            "Content-Type": "text/plain; charset=UTF-8",
+            "Cache-Control": "no-store"
+          }
+        });
       }
 
-      // === 列表 ===
+      // ========== 前端页面 ==========
+      if (path === "/") {
+        return new Response(generateHTML(env), {
+          headers: { "Content-Type": "text/html; charset=UTF-8" }
+        });
+      }
+
+      // ========== 管理员登录 ==========
+      const clientPassword = url.searchParams.get("password");
+
+      if (path === "/login") {
+        const ok = clientPassword === env.ADMIN_PASSWORD;
+
+        await sendTG(env, ok ? "🔓 管理员登录成功" : "🔒 管理员登录失败", {
+          "位置": cfLocation,
+          "IP": ip,
+          "UA": ua
+        });
+
+        return new Response(ok ? "登录成功" : "密码错误", {
+          status: ok ? 200 : 403
+        });
+      }
+
+      // ========== API 密码保护 ==========
+      if (clientPassword !== env.ADMIN_PASSWORD) {
+        return new Response("越权访问被拒绝", { status: 403 });
+      }
+
+      // ========== 查看详情 ==========
+      if (path === "/detail") {
+        const key = url.searchParams.get("key") || "";
+        const val = await kv.get(key);
+
+        return val
+          ? new Response(val, {
+              headers: { "Content-Type": "application/json;charset=UTF-8" }
+            })
+          : new Response("订阅不存在", { status: 404 });
+      }
+
+      // ========== 新增 / 更新订阅 ==========
+      if (path === "/save" || path === "/update") {
+        const content = await request.text();
+        if (!content) return new Response("缺少内容", { status: 400 });
+
+        let realKey = url.searchParams.get("key");
+        let oldItem = null;
+
+        if (path === "/update" && realKey) {
+          const old = await kv.get(realKey);
+          if (!old) return new Response("订阅不存在", { status: 404 });
+          oldItem = JSON.parse(old);
+        } else {
+          realKey = Array.from({ length: 8 }, () =>
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(Math.random() * 62)]
+          ).join("");
+        }
+
+        const displayName = url.searchParams.get("displayName") || "未命名";
+        const note = url.searchParams.get("note") || "";
+        const days = parseInt(url.searchParams.get("days"), 10) || 0;
+
+        const now = Date.now();
+        const expire = days > 0
+          ? now + days * 86400000
+          : (path === "/update" ? oldItem?.expire : null);
+
+        const item = {
+          realKey,
+          displayName,
+          content,
+          expire,
+          note,
+          created: oldItem?.created || now
+        };
+
+        await kv.put(realKey, JSON.stringify(item));
+
+        await sendTG(env, path === "/save" ? "🟢 新增订阅" : "🟡 更新订阅", {
+          "名称": displayName,
+          "Key": realKey,
+          "有效期": expire ? `${Math.ceil((expire - now) / 86400000)}天` : "永久",
+          "备注": note || "无"
+        });
+
+        return new Response(path === "/save" ? "保存成功" : "更新成功");
+      }
+
+      // ========== 删除订阅 ==========
+      if (path === "/delete") {
+        const key = url.searchParams.get("key") || "";
+        const old = await kv.get(key);
+        const item = old ? JSON.parse(old) : null;
+
+        await kv.delete(key);
+
+        await sendTG(env, "🔴 删除订阅", {
+          "名称": item?.displayName || "未知",
+          "Key": key
+        });
+
+        return new Response("删除成功");
+      }
+      // ========== 📋 订阅列表 ==========
       if (path === "/list") {
         const page = parseInt(url.searchParams.get("page"), 10) || 1;
-        const search = url.searchParams.get("search") || "";
+        const search = (url.searchParams.get("search") || "").toLowerCase();
         const sortField = url.searchParams.get("sort") || "displayName";
         const sortOrder = url.searchParams.get("order") || "asc";
 
-        // 使用 kv.list 获取 key 列表（limit 可调）
         const listKV = await kv.list({ limit: 1000 }).catch(() => ({ keys: [] }));
-        let allItems = [];
+        const values = await Promise.all(listKV.keys.map(k => kv.get(k.name)));
 
-        for (const k of listKV.keys) {
-          try {
-            const v = await kv.get(k.name);
-            if (!v) continue;
-            const item = JSON.parse(v);
-            if (!item || !item.content) continue;
-            const remaining = item.expire ? formatRemainingDays(item.expire) : "∞";
-            allItems.push({
-              displayName: item.displayName,
-              realKey: item.realKey,
-              remainingDays: remaining,
-              content: item.content,
-              note: item.note || "",
-              created: item.created || null
-            });
-          } catch (e) {
-            // 忽略单条异常
-            continue;
-          }
-        }
+        let items = values.filter(Boolean).map(v => JSON.parse(v)).map(i => ({
+          displayName: i.displayName || "未命名",
+          realKey: i.realKey,
+          remainingDays: i.expire
+            ? (Date.now() > i.expire ? "已过期" : Math.ceil((i.expire - Date.now()) / 86400000))
+            : "∞",
+          note: i.note || "",
+          created: i.created || 0
+        }));
 
         // 搜索过滤
-        if (search.trim() !== "") {
-          const s = search.toLowerCase();
-          allItems = allItems.filter(i =>
-            (i.displayName || "").toLowerCase().includes(s) ||
-            (i.realKey || "").toLowerCase().includes(s)
+        if (search) {
+          items = items.filter(i =>
+            i.displayName.toLowerCase().includes(search) ||
+            i.realKey.toLowerCase().includes(search) ||
+            i.note.toLowerCase().includes(search)
           );
         }
 
         // 排序
-        allItems.sort((a, b) => {
-          let va = a[sortField], vb = b[sortField];
+        items.sort((a, b) => {
+          let va = a[sortField];
+          let vb = b[sortField];
 
-          // 特殊处理 remainingDays 字段：'∞' -> Infinity, '已过期' -> -1
           if (sortField === "remainingDays") {
-            const conv = v => (v === "∞" ? Infinity : (v === "已过期" ? -1 : Number(v)));
-            va = conv(va); vb = conv(vb);
-          }
-
-          // created 字段：转为时间戳比较
-          if (sortField === "created") {
-            va = a.created ? Number(a.created) : 0;
-            vb = b.created ? Number(b.created) : 0;
+            const cv = v => v === "∞" ? Infinity : (v === "已过期" ? -1 : Number(v));
+            va = cv(va);
+            vb = cv(vb);
           }
 
           if (va > vb) return sortOrder === "asc" ? 1 : -1;
@@ -184,311 +237,244 @@ async function handleRequest(request, env) {
           return 0;
         });
 
-        const totalPages = Math.max(1, Math.ceil(allItems.length / 10));
-        const start = (page - 1) * 10;
-        const pageItems = allItems.slice(start, start + 10);
+        const totalPages = Math.max(1, Math.ceil(items.length / 10));
 
-        return new Response(JSON.stringify({ page, totalPages, items: pageItems }), { headers: { "Content-Type": "application/json; charset=UTF-8" } });
+        return new Response(JSON.stringify({
+          page,
+          totalPages,
+          items: items.slice((page - 1) * 10, page * 10)
+        }), {
+          headers: {
+            "Content-Type": "application/json;charset=UTF-8"
+          }
+        });
       }
-    }
 
-    // ========== 默认：返回管理页面 HTML ==========
-    return new Response(generateHTML(env), { headers: { "Content-Type": "text/html; charset=UTF-8" } });
+      return new Response("Not Found", { status: 404 });
 
-  } catch (err) {
-    return new Response("Worker 内部错误: " + (err && err.message ? err.message : String(err)), { status: 500 });
-  }
-} // end handleRequest
-
-// -------------------- 辅助工具函数 --------------------
-
-// 生成随机 key（不含冲突前缀的简单版本）
-function generateRandomKey(len = 8) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let s = '';
-  for (let i = 0; i < len; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
-  return s;
-}
-
-// 获取北京时间（可靠）
-function getBeijingTime() {
-  const now = new Date();
-  const utc = now.getTime() + now.getTimezoneOffset() * 60000;
-  const bj = new Date(utc + 8 * 3600000);
-  return bj.toISOString().replace("T", " ").split(".")[0];
-}
-
-// 计算剩余天数或已过期
-function formatRemainingDays(expireMillis) {
-  if (!expireMillis) return "∞";
-  const now = Date.now();
-  if (now > expireMillis) return "已过期";
-  const diff = expireMillis - now;
-  const days = Math.ceil(diff / (1000 * 60 * 60 * 24));
-  return days;
-}
-
-/**
- * 从 Request 中提取 IP 和 UA 的健壮方法
- * 返回 { ip: { v4, v6, main }, ua }
- */
-function getClientInfo(req) {
-  // 支持 Headers 对象或普通 map（兼容模拟请求）
-  const headers = req && req.headers ? req.headers : {};
-  const getHeader = (h) => {
-    try {
-      if (!headers) return null;
-      if (typeof headers.get === "function") return headers.get(h);
-      if (headers[h]) return headers[h];
-      if (typeof headers.get === "function") return headers.get(h);
-      return null;
-    } catch (e) {
-      return null;
-    }
-  };
-
-  let cfIp = getHeader("cf-connecting-ip") || getHeader("x-forwarded-for") || getHeader("x-real-ip") || null;
-  const ua = getHeader("user-agent") || null;
-
-  if (cfIp && cfIp.includes(",")) {
-    const parts = cfIp.split(",").map(s => s.trim()).filter(Boolean);
-    if (parts.length) cfIp = parts[0];
-  }
-
-  let v4 = null, v6 = null;
-  const isV4 = ip => /^\d{1,3}(\.\d{1,3}){3}$/.test(ip);
-  if (cfIp) {
-    if (isV4(cfIp)) v4 = cfIp;
-    else if (cfIp.includes(":")) v6 = cfIp;
-  }
-
-  // try x-forwarded-for chain for IPv4
-  const xff = getHeader("x-forwarded-for");
-  if (xff) {
-    const ips = xff.split(",").map(s => s.trim());
-    for (const ip of ips) {
-      if (isV4(ip)) { v4 = v4 || ip; break; }
+    } catch (err) {
+      return new Response(
+        "Worker 内部错误: " + (err?.message || String(err)),
+        { status: 500 }
+      );
     }
   }
+};
 
-  const main = v4 || v6 || cfIp || "未知 IP";
-  return { ip: { v4, v6, main }, ua: ua || "未知设备" };
+
+// ========== Base64 编码（支持中文） ==========
+function safeBtoa(str) {
+  try {
+    return btoa(
+      encodeURIComponent(str).replace(
+        /%([0-9A-F]{2})/g,
+        (_, p1) => String.fromCharCode(parseInt(p1, 16))
+      )
+    );
+  } catch {
+    return btoa(str);
+  }
 }
 
-// -------------------- Part 2 end --------------------
-// =====================================================
-//                 Telegram 通知系统
-// =====================================================
 
-// 统一发送（安全 Markdown）
-async function tgSend(env, text) {
+// ========== Telegram 通知 ==========
+async function sendTG(env, title, fields = {}) {
   const token = env.TELEGRAM_BOT_TOKEN;
   const chatId = env.TELEGRAM_CHAT_ID;
+
   if (!token || !chatId) return;
 
-  const url = `https://api.telegram.org/bot${token}/sendMessage`;
-
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "MarkdownV2",
-      disable_web_page_preview: true
+  const time = new Date()
+    .toLocaleString("zh-CN", {
+      timeZone: "Asia/Shanghai",
+      hour12: false
     })
-  }).catch(() => {});
-}
+    .replace(/\//g, "-");
 
-// Escape Telegram MarkdownV2 保证字符安全
-function esc(t) {
-  if (!t) return "";
-  return t.replace(/([_*\[\]()~`>#+=\-|{}.!])/g, "\\$1");
-}
+  const escape = t =>
+    String(t || "").replace(
+      /([_*\[\]()~`>#+=\-|{}.!])/g,
+      "\\$1"
+    );
 
-// =====================================================
-//                     管理通知
-//         type = 新增 / 更新 / 删除
-// =====================================================
-async function sendTGNotificationAdmin(env, item, type, extra) {
-  const ts = getBeijingTime();
-  const title = type === "新增" ? "🟢 新增订阅" :
-                type === "更新" ? "🟡 更新订阅" :
-                type === "删除" ? "🔴 删除订阅" : "🧰 管理操作";
+  const body = Object.entries(fields)
+    .filter(([_, v]) => v)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join("\n");
 
-  let lines = [];
-  const pushIf = (label, value) => {
-    if (value !== null && value !== undefined && value !== "") {
-      lines.push(`*${label}*: ${esc(String(value))}`);
+  const text =
+`*${escape(title)}*
+⏰ ${escape(time)}
+
+${body}`;
+
+  await fetch(
+    `https://api.telegram.org/bot${token}/sendMessage`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: "MarkdownV2",
+        disable_notification: true
+      })
     }
-  };
-
-  pushIf("📛 名称", item.displayName);
-  pushIf("🔑 Key", item.realKey);
-
-  if (item.expire) {
-    const remain = formatRemainingDays(item.expire);
-    pushIf("📅 过期时间", new Date(item.expire + 8 * 3600000).toISOString().replace("T", " ").split(".")[0]);
-    pushIf("📅 剩余天数", remain);
-  }
-
-  pushIf("📝 备注", item.note);
-
-  const msg =
-    `*${esc(title)}*\n` +
-    `*⏰ 时间：${esc(ts)}*\n\n` +
-    lines.join("\n");
-
-  await tgSend(env, msg);
+  ).catch(() => {});
 }
 
-// =====================================================
-//                     访问通知
-// =====================================================
-async function sendTGNotificationAccess(env, item, ip, ua, location) {
-  const ts = getBeijingTime();
-  let lines = [];
-
-  const pushIf = (label, value) => {
-    if (value !== null && value !== undefined && value !== "") {
-      lines.push(`*${label}*: ${esc(String(value))}`);
-    }
-  };
-
-  // 订阅信息
-  pushIf("📛 订阅", item.displayName);
-  pushIf("🔑 Key", item.realKey);
-
-  // 位置信息
-  pushIf("📍 地区", location || "未知");
-
-  // IP（优先显示 IPv4）
-  if (ip && (ip.v4 || ip.v6)) {
-    if (ip.v4) pushIf("🌐 IPv4", ip.v4);
-    if (ip.v6) pushIf("🌐 IPv6", ip.v6);
-  }
-
-  // 设备信息
-  pushIf("💻 设备", ua);
-
-  const msg =
-    `*🧭 订阅被访问*\n` +
-    `*时间：${esc(ts)}*\n\n` +
-    lines.join("\n");
-
-  await tgSend(env, msg);
-}
-
-// -------------------- Part 3 end --------------------
+// ========== 前端 UI 管理页面 HTML ==========
 function generateHTML(env) {
-  const ADMIN_PASSWORD = env?.ADMIN_PASSWORD || "";
-  let html = "";
-  html += "<!DOCTYPE html>";
-  html += "<html lang='zh-CN'>";
-  html += "<head>";
-  html += "<meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=1'>";
-  html += "<title>KV订阅管理</title>";
-  html += "<style>";
-  html += "body{font-family:Arial,Helvetica,sans-serif;margin:0;padding:0;background:#f0f2f5;}";
-  html += ".container{max-width:900px;margin:20px auto;padding:20px;background:#fff;border-radius:12px;box-shadow:0 5px 15px rgba(0,0,0,0.1);}";
-  html += "h2{color:#333;margin-bottom:15px;}";
-  html += "input,textarea,select,button{font-size:14px;margin:5px 0;padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;box-sizing:border-box;}";
-  html += "button{background:#4facfe;color:#fff;border:none;cursor:pointer;}";
-  html += "button:hover{background:#00f2fe;}";
-  html += "table{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px;}";
-  html += "th,td{border:1px solid #ddd;padding:8px;text-align:center;}";
-  html += "th{background:#4facfe;color:#fff;}";
-  html += ".copy-btn{padding:4px 8px;border-radius:6px;background:#00c1ff;color:#fff;cursor:pointer;border:none;}";
-  html += ".copy-btn:hover{background:#0086b3;}";
-  html += ".edit-btn{background:#ffa500;color:#fff;}";
-  html += ".edit-btn:hover{background:#cc8400;}";
-  html += ".delete-btn{background:#ff5c5c;color:#fff;}";
-  html += ".delete-btn:hover{background:#cc0000;}";
-  html += ".pagination{margin-top:10px;text-align:center;}";
-  html += ".pagination button{margin:0 3px;}";
-  html += ".search-sort{margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;}";
-  html += ".search-sort input, .search-sort select{flex:1;min-width:100px;}";
-  html += "@media(max-width:600px){.search-sort{flex-direction:column;}}";
-  html += "</style>";
-  html += "</head>";
-  html += "<body>";
-  html += "<div class='container'>";
-  html += "<h2>KV订阅管理</h2>";
-  html += "<div id='loginDiv'>";
-  html += "<label>管理员密码:</label><input type='password' id='adminPassword'>";
-  html += "<button id='loginBtn'>登录</button></div>";
-  html += "<div id='mainDiv' style='display:none;'>";
-  html += "<div class='search-sort'>";
-  html += "<input type='text' id='search' placeholder='搜索名称'>";
-  html += "<select id='sort'><option value='displayName'>名称排序</option><option value='remainingDays'>剩余天数排序</option></select>";
-  html += "<select id='order'><option value='asc'>升序</option><option value='desc'>降序</option></select>";
-  html += "<button id='searchBtn'>搜索/排序</button></div>";
-  html += "<label>订阅显示名称:</label><input type='text' id='key' placeholder='如 node1'>";
-  html += "<label>订阅内容:</label><textarea id='text' rows='5' placeholder='输入订阅节点内容'></textarea>";
-  html += "<label>备注:</label><input type='text' id='note' placeholder='节点备注'>";
-  html += "<label>有效天数 (0 表示永久):</label><input type='number' id='days' placeholder='例如 7'>";
-  html += "<button id='saveBtn'>保存订阅</button>";
-  html += "<h3>已保存订阅列表：</h3>";
-  html += "<table><thead><tr><th>名称</th><th>备注</th><th>剩余天数</th><th>Base64</th><th>URL</th><th>编辑</th><th>删除</th></tr></thead>";
-  html += "<tbody id='keylist'></tbody></table>";
-  html += "<div class='pagination' id='pagination'></div>";
-  html += "</div>";
-  html += "<script>";
-  html += "const ADMIN_PASSWORD=" + JSON.stringify(ADMIN_PASSWORD) + ";";
-  html += "let currentPage=1,currentSearch='',currentSort='displayName',currentOrder='asc',currentEditingKey=null;";
-  html += "document.addEventListener('DOMContentLoaded',()=>{";
-  html += "document.getElementById('loginBtn').addEventListener('click',async()=>{";
-  html += "const pw=document.getElementById('adminPassword').value.trim();";
-  html += "if(pw===ADMIN_PASSWORD){document.getElementById('loginDiv').style.display='none';";
-  html += "document.getElementById('mainDiv').style.display='block';";
-  html += "await fetch('/login?password='+encodeURIComponent(ADMIN_PASSWORD)).catch(()=>{});";
-  html += "loadKeyList(1);}else alert('密码错误');});";
-  html += "document.getElementById('saveBtn').addEventListener('click',saveOrUpdateData);";
-  html += "document.getElementById('searchBtn').addEventListener('click',()=>{";
-  html += "currentSearch=document.getElementById('search').value.trim();";
-  html += "currentSort=document.getElementById('sort').value;";
-  html += "currentOrder=document.getElementById('order').value;";
-  html += "loadKeyList(1);});});";
-  html += "async function loadKeyList(page=1){currentPage=page;";
-  html += "try{const resp=await fetch('/list?page='+page+'&search='+encodeURIComponent(currentSearch)+'&sort='+currentSort+'&order='+currentOrder+'&password='+encodeURIComponent(ADMIN_PASSWORD));";
-  html += "if(!resp.ok){alert('加载失败:'+await resp.text());return;}";
-  html += "const data=await resp.json();";
-  html += "const tbody=document.getElementById('keylist');tbody.innerHTML='';";
-  html += "data.items.forEach(item=>{const tr=document.createElement('tr');";
-  html += "tr.innerHTML=\"<td>\"+item.displayName+\"</td><td>\"+item.note+\"</td><td>\"+item.remainingDays+\"</td>\"+";
-  html += "\"<td><button class='copy-btn'>复制</button></td><td><button class='copy-btn'>复制</button></td>\"+";
-  html += "\"<td><button class='edit-btn'>编辑</button></td><td><button class='delete-btn'>删除</button></td>\";";
-  html += "tbody.appendChild(tr);";
-  html += "tr.children[3].addEventListener('click',()=>copyBase64(item.realKey));";
-  html += "tr.children[4].addEventListener('click',()=>copyURL(item.realKey));";
-  html += "tr.children[5].addEventListener('click',()=>editItem(item.realKey,item.displayName,item.content,item.note));";
-  html += "tr.children[6].addEventListener('click',()=>deleteKey(item.realKey));});";
-  html += "const pageDiv=document.getElementById('pagination');pageDiv.innerHTML='';";
-  html += "for(let i=1;i<=data.totalPages;i++){const btn=document.createElement('button');btn.textContent=i;";
-  html += "if(i===data.page)btn.disabled=true;btn.addEventListener('click',()=>loadKeyList(i));pageDiv.appendChild(btn);}";
-  html += "}catch(err){alert('加载失败:'+err.message);}}";
-  html += "async function saveOrUpdateData(){const displayName=document.getElementById('key').value.trim()||'未命名';";
-  html += "const text=document.getElementById('text').value.trim();const note=document.getElementById('note').value.trim();";
-  html += "let days=parseInt(document.getElementById('days').value,10);if(isNaN(days)||days<0)days=0;";
-  html += "if(!text){alert('请输入订阅内容');return;}";
-  html += "try{if(currentEditingKey){const resp=await fetch('/update?key='+encodeURIComponent(currentEditingKey)+'&displayName='+encodeURIComponent(displayName)+'&days='+encodeURIComponent(days)+'&note='+encodeURIComponent(note)+'&password='+encodeURIComponent(ADMIN_PASSWORD),{method:'POST',body:text});";
-  html += "alert(await resp.text());currentEditingKey=null;document.getElementById('saveBtn').textContent='保存订阅';}else{";
-  html += "const resp=await fetch('/save?key='+encodeURIComponent(displayName)+'&days='+encodeURIComponent(days)+'&note='+encodeURIComponent(note),{method:'POST',body:text});";
-  html += "alert(await resp.text());}";
-  html += "document.getElementById('key').value='';document.getElementById('text').value='';document.getElementById('note').value='';document.getElementById('days').value='';";
-  html += "loadKeyList(currentPage);}catch(err){alert('保存失败:'+err.message);}}";
-  html += "function editItem(realKey,displayName,content,note){document.getElementById('key').value=displayName;";
-  html += "document.getElementById('text').value=content;document.getElementById('note').value=note||'';";
-  html += "currentEditingKey=realKey;document.getElementById('saveBtn').textContent='更新订阅';}";
-  html += "async function deleteKey(key){if(!confirm('确定删除 \"'+key+'\"?'))return;";
-  html += "try{const resp=await fetch('/delete?key='+encodeURIComponent(key)+'&password='+encodeURIComponent(ADMIN_PASSWORD),{method:'POST'});";
-  html += "alert(await resp.text());loadKeyList(currentPage);}catch(err){alert('删除失败:'+err.message);}}";
-  html += "async function copyText(text){if(!text)return;try{await navigator.clipboard.writeText(text);}catch(e){prompt('复制失败，请手动复制:',text);}alert('已复制!');}";
-  html += "async function copyBase64(key){try{let resp=await fetch('/get/'+encodeURIComponent(key));let base64=await resp.text();await copyText(base64);}catch(err){alert('复制 Base64 失败:'+err.message);}}";
-  html += "async function copyURL(key){try{let url=window.location.origin+'/get/'+encodeURIComponent(key);await copyText(url);}catch(err){alert('复制 URL 失败:'+err.message);}}";
-  html += "</script></div></body></html>";
-  return html;
-}
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+	<title>KV订阅管理</title>
+  <link rel='icon' href='https://cftc.sunmoonyou.workers.dev/1771998133339_favicon.ico' type='image/x-icon'></link>
+	<style>
+		body{font-family:sans-serif;margin:0;padding:0;background:#f0f2f5;}
+		.container{max-width:900px;margin:20px auto;padding:20px;background:#fff;border-radius:12px;box-shadow:0 5px 15px rgba(0,0,0,0.1);}
+		input,textarea,select,button{font-size:14px;margin:5px 0;padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;box-sizing:border-box;}
+		button{background:#4facfe;color:#fff;border:none;cursor:pointer;}button:hover{background:#00f2fe;}
+		table{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px;}
+		th,td{border:1px solid #ddd;padding:8px;text-align:center;}th{background:#4facfe;color:#fff;}
+		.copy-btn{background:#00c1ff;color:#fff;padding:4px 8px;border:none;border-radius:6px;cursor:pointer;}
+		.edit-btn{background:#ffa500;color:#fff;} .delete-btn{background:#ff5c5c;color:#fff;}
+		.pagination{margin-top:10px;text-align:center;} .pagination button{width:auto;padding:5px 10px;margin:0 2px;}
+		.search-sort{margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;} .search-sort *{flex:1;min-width:100px;}
+		@media(max-width:600px){.search-sort{flex-direction:column;}}
+	</style>
+</head>
+<body>
+<div class="container">
+	<h2>KV订阅管理</h2>
+  <link rel='icon' href='https://cftc.sunmoonyou.workers.dev/1771998133339_favicon.ico' type='image/x-icon'></link>
+	<div id="loginDiv"><label>管理员密码:</label><input type="password" id="adminPassword"><button id="loginBtn">登录</button></div>
+	<div id="mainDiv" style="display:none;">
+		<div class="search-sort">
+			<input type="text" id="search" placeholder="搜索名称">
+			<select id="sort"><option value="displayName">名称排序</option><option value="remainingDays">剩余天数排序</option></select>
+			<select id="order"><option value="asc">升序</option><option value="desc">降序</option></select>
+			<button id="searchBtn">搜索/排序</button>
+		</div>
+		<label>订阅显示名称:</label><input type="text" id="key" placeholder="如 node1">
+		<label>订阅内容:</label><textarea id="text" rows="5" placeholder="输入订阅节点内容"></textarea>
+		<label>备注:</label><input type="text" id="note" placeholder="节点备注">
+		<label>有效天数 (0 表示永久):</label><input type="number" id="days" placeholder="例如 7">
+		<button id="saveBtn">保存订阅</button>
+		<h3>已保存订阅列表：</h3>
+		<table>
+			<thead><tr><th>名称</th><th>备注</th><th>剩余天数</th><th>URL</th><th>编辑</th><th>删除</th></tr></thead>
+			<tbody id="keylist"></tbody>
+		</table>
+		<div class="pagination" id="pagination"></div>
+	</div>
+</div>
+<script>
+	let ADMIN_PASSWORD = '';
+	let currentPage=1, currentSearch='', currentSort='displayName', currentOrder='asc', currentEditingKey=null;
 
-// -------------------- Worker.js 完整版结束 --------------------
+	document.getElementById('loginBtn').addEventListener('click', async () => {
+		const pw = document.getElementById('adminPassword').value.trim();
+		try {
+			const resp = await fetch('/login?password=' + encodeURIComponent(pw));
+			if(resp.status === 200){
+				ADMIN_PASSWORD = pw; // 只有拿到后端 200 回应，才解锁全局密码变量
+				document.getElementById('loginDiv').style.display = 'none';
+				document.getElementById('mainDiv').style.display = 'block';
+				loadKeyList(1);
+			} else {
+				alert('密码错误');
+			}
+		} catch(e) {
+			alert('登录失败，请检查网络');
+		}
+	});
+
+	document.getElementById('searchBtn').addEventListener('click', () => {
+		currentSearch = document.getElementById('search').value.trim();
+		currentSort = document.getElementById('sort').value;
+		currentOrder = document.getElementById('order').value;
+		loadKeyList(1);
+	});
+
+	document.getElementById('saveBtn').addEventListener('click', async () => {
+		const displayName = document.getElementById('key').value.trim() || '未命名';
+		const text = document.getElementById('text').value.trim();
+		const note = document.getElementById('note').value.trim();
+		const days = parseInt(document.getElementById('days').value, 10) || 0;
+		if(!text) return alert('请输入订阅内容');
+
+		try {
+			// 修改或新增的精准分流路由传参
+			const url = currentEditingKey 
+				? \`/update?key=\${encodeURIComponent(currentEditingKey)}&displayName=\${encodeURIComponent(displayName)}&days=\${days}&note=\${encodeURIComponent(note)}&password=\${encodeURIComponent(ADMIN_PASSWORD)}\`
+				: \`/save?displayName=\${encodeURIComponent(displayName)}&days=\${days}&note=\${encodeURIComponent(note)}&password=\${encodeURIComponent(ADMIN_PASSWORD)}\`;
+			
+			const resp = await fetch(url, { method: 'POST', body: text });
+			alert(await resp.text());
+			
+			currentEditingKey = null;
+			document.getElementById('saveBtn').textContent = '保存订阅';
+			['key','text','note','days'].forEach(id => document.getElementById(id).value = '');
+			loadKeyList(currentPage);
+		} catch(err) { alert('操作失败'); }
+	});
+
+	async function loadKeyList(page = 1) {
+		if(!ADMIN_PASSWORD) return; // 拦截器：如果密码未解锁，断绝发起列表加载请求
+		currentPage = page;
+		try {
+			const resp = await fetch(\`/list?page=\${page}&search=\${encodeURIComponent(currentSearch)}&sort=\${currentSort}&order=\${currentOrder}&password=\${encodeURIComponent(ADMIN_PASSWORD)}\`);
+			if (resp.status !== 200) return;
+			const data = await resp.json();
+			const tbody = document.getElementById('keylist'); tbody.innerHTML = '';
+			
+			data.items.forEach(item => {
+				const tr = document.createElement('tr');
+				tr.innerHTML = \`<td>\${item.displayName}</td><td>\${item.note}</td><td>\${item.remainingDays}</td>
+				<td><button class="copy-btn">复制</button></td>
+				<td><button class="copy-btn edit-btn">编辑</button></td><td><button class="copy-btn delete-btn">删除</button></td>\`;
+				tbody.appendChild(tr);
+
+				tr.querySelector('.copy-btn').addEventListener('click', () => { navigator.clipboard.writeText(window.location.origin + '/get/' + encodeURIComponent(item.realKey)); alert('已复制!'); });
+				tr.querySelector('.edit-btn').addEventListener('click', () => editItem(item.realKey));
+				tr.querySelector('.delete-btn').addEventListener('click', () => deleteKey(item.realKey));
+			});
+
+			const pageDiv = document.getElementById('pagination'); pageDiv.innerHTML = '';
+			for(let i = 1; i <= data.totalPages; i++) {
+				const btn = document.createElement('button'); btn.textContent = i;
+				if(i === data.page) btn.disabled = true;
+				btn.addEventListener('click', () => loadKeyList(i));
+				pageDiv.appendChild(btn);
+			}
+		} catch(e) { }
+	}
+
+	async function editItem(realKey) {
+		const resp = await fetch(\`/detail?key=\${encodeURIComponent(realKey)}&password=\${encodeURIComponent(ADMIN_PASSWORD)}\`);
+		if (resp.status !== 200) return alert('获取详情失败');
+		const item = await resp.json();
+		document.getElementById('key').value = item.displayName || '';
+		document.getElementById('text').value = item.content || '';
+		document.getElementById('note').value = item.note || '';
+		document.getElementById('days').value = item.expire ? Math.max(0, Math.ceil((item.expire - Date.now()) / 86400000)) : 0;
+		currentEditingKey = realKey;
+		document.getElementById('saveBtn').textContent = '更新订阅';
+	}
+
+	async function deleteKey(key) {
+		if(confirm('确定删除?')) {
+			const resp = await fetch(\`/delete?key=\${encodeURIComponent(key)}&password=\${encodeURIComponent(ADMIN_PASSWORD)}\`, { method: 'POST' });
+			alert(await resp.text());
+			loadKeyList(currentPage);
+		}
+	}
+</script>
+</body>
+</html>`;
+}
