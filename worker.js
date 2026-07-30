@@ -5,131 +5,83 @@ export default {
       const path = url.pathname;
       const kv = env.NODES_KV;
 
-      // ========== 基础路由过滤 ==========
+      // 1. 基础路由安全过滤
       const allowedPaths = ["/", "/login", "/save", "/update", "/delete", "/list", "/detail"];
-      if (!allowedPaths.includes(path) && !path.startsWith("/get/")) {
-        return new Response("Not Found", { status: 404 });
-      }
+      if (!allowedPaths.includes(path) && !path.startsWith("/get/")) return new Response("Not Found", { status: 404 });
       if (!kv) return new Response("未绑定 NODES_KV", { status: 500 });
 
-      // ========== 获取访客信息 ==========
+      // 提取核心物理信息
       const ua = request.headers.get("user-agent") || "未知设备";
       const ip = (request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "未知IP").split(",")[0].trim();
       const cfLocation = request.cf?.city ? `${request.cf.country}, ${request.cf.city}` : (request.cf?.country || "未知国家");
 
-      // ========== 🌏 地区限制：仅允许中国大陆 ==========
-      if (request.cf?.country !== "CN") {
+      // ========== 🌏 地区访问限制：仅允许中国大陆 ==========
+      const country = request.cf?.country || "";
+
+      if (country !== "CN") {
         return new Response("当前区域不支持访问", {
           status: 403,
-          headers: { "Content-Type": "text/plain; charset=UTF-8" }
+          headers: {
+            "Content-Type": "text/plain; charset=UTF-8"
+          }
         });
       }
 
-      // ========== 🧭 订阅获取接口 ==========
+      // ========== 🧭 1. 客户端拉取订阅路由 (完全独立) ==========
       if (path.startsWith("/get/")) {
         const realKey = path.replace("/get/", "");
         if (!realKey) return new Response("缺少 Key", { status: 400 });
 
-        // 客户端 UA 白名单
-        const uaWhitelist = [
-          "clash",
-          "quantumult",
-          "surge",
-          "shadowrocket",
-          "v2ray",
-          "sing-box",
-          "loon",
-          "v2rayng",
-          "nekobox",
-          "tbox",
-          "passwall"
-        ];
-
+        // UA 阻断白名单
+        const uaWhitelist = ["clash", "quantumult", "surge", "shadowrocket", "v2ray", "sing-box", "loon", "v2rayng", "nekobox", "tbox", "passwall"];
         if (!uaWhitelist.some(k => ua.toLowerCase().includes(k))) {
+          await sendTG(env, "❌ 订阅访问被拦截 (UA非法)", { "提取 🔑": realKey, "访问位置": `${cfLocation} (已被拒绝)`, "IP 地址": ip, "客户端 UA": ua });
           return new Response("未授权的客户端类型", { status: 403 });
         }
 
         const value = await kv.get(realKey);
         if (!value) {
-          await sendTG(env, "⚠️ 订阅访问失败", {
-            "原因": "订阅不存在",
-            "Key": realKey,
-            "位置": cfLocation,
-            "IP": ip
-          });
+          await sendTG(env, "⚠️ 订阅访问失败 (不存在)", { "提取 🔑": realKey, "访问位置": cfLocation, "IP 地址": ip, "客户端 UA": ua });
           return new Response("订阅不存在", { status: 404 });
         }
 
         const item = JSON.parse(value);
-
-        // 检查过期
         if (item.expire && Date.now() > item.expire) {
-          await sendTG(env, "⏳ 订阅已过期", {
-            "名称": item.displayName,
-            "Key": item.realKey,
-            "位置": cfLocation
-          });
+          await sendTG(env, "⏳ 订阅访问失败 (已过期)", { "订阅名称": item.displayName, "提取 🔑": item.realKey, "访问位置": `${cfLocation} (时效过期)`, "IP 地址": ip, "客户端 UA": ua });
           return new Response("订阅已过期", { status: 403 });
         }
 
-        await sendTG(env, "🧭 订阅节点访问", {
-          "名称": item.displayName,
-          "Key": item.realKey,
-          "位置": cfLocation,
-          "IP": ip,
-          "UA": ua
-        });
-
-        return new Response(safeBtoa(item.content), {
-          headers: {
-            "Content-Type": "text/plain; charset=UTF-8",
-            "Cache-Control": "no-store"
-          }
-        });
+        await sendTG(env, "🧭 订阅节点被访问", { "订阅名称": item.displayName, "提取 🔑": item.realKey, "访问位置": cfLocation, "IP 地址": ip, "客户端 UA": ua });
+        return new Response(safeBtoa(item.content), { headers: { "Content-Type": "text/plain; charset=UTF-8", "Cache-Control": "no-store, no-cache, must-revalidate" } });
       }
 
-      // ========== 前端页面 ==========
+      // ========== 🖼️ 2. 分发管理前端主页 (无需密码拦截) ==========
       if (path === "/") {
-        return new Response(generateHTML(env), {
-          headers: { "Content-Type": "text/html; charset=UTF-8" }
-        });
+        return new Response(generateHTML(env), { headers: { "Content-Type": "text/html; charset=UTF-8" } });
       }
 
-      // ========== 管理员登录 ==========
+      // ========== 🔓 3. 管理员登录验证接口 (全权且唯一负责登录成功/失败通知) ==========
       const clientPassword = url.searchParams.get("password");
-
       if (path === "/login") {
-        const ok = clientPassword === env.ADMIN_PASSWORD;
-
-        await sendTG(env, ok ? "🔓 管理员登录成功" : "🔒 管理员登录失败", {
-          "位置": cfLocation,
-          "IP": ip,
-          "UA": ua
+        const isLoginValid = clientPassword === env.ADMIN_PASSWORD;
+        await sendTG(env, isLoginValid ? "🔓 管理员登录成功" : "🔒 管理员登录失败", { 
+          [isLoginValid ? "登录位置" : "尝试位置"]: cfLocation, "IP 地址": ip, "客户端 UA": ua 
         });
-
-        return new Response(ok ? "登录成功" : "密码错误", {
-          status: ok ? 200 : 403
-        });
+        return new Response(isLoginValid ? "登录成功" : "密码错误", { status: isLoginValid ? 200 : 403 });
       }
 
-      // ========== API 密码保护 ==========
+      // ========== 🚫 4. 核心 API 安全铁闸 (非 /login 接口密码错误时【全部静默拒绝】，不发任何 TG 通知) ==========
       if (clientPassword !== env.ADMIN_PASSWORD) {
         return new Response("越权访问被拒绝", { status: 403 });
       }
 
-      // ========== 查看详情 ==========
+      // ========== ⚙️ 5. 后台管理核心功能区 (此时密码已绝对安全) ==========
       if (path === "/detail") {
-        const key = url.searchParams.get("key") || "";
-        const val = await kv.get(key);
-
-        return val
-          ? new Response(val, {
-              headers: { "Content-Type": "application/json;charset=UTF-8" }
-            })
-          : new Response("订阅不存在", { status: 404 });
+        const detailVal = await kv.get(url.searchParams.get("key") || "");
+        return detailVal ? new Response(detailVal, { headers: { "Content-Type": "application/json; charset=UTF-8" } }) : new Response("订阅不存在", { status: 404 });
       }
 
-      // ========== 新增 / 更新订阅 ==========
+      // 保存与更新
       if (path === "/save" || path === "/update") {
         const content = await request.text();
         if (!content) return new Response("缺少内容", { status: 400 });
@@ -138,13 +90,12 @@ export default {
         let oldItem = null;
 
         if (path === "/update" && realKey) {
-          const old = await kv.get(realKey);
-          if (!old) return new Response("订阅不存在", { status: 404 });
-          oldItem = JSON.parse(old);
+          const oldVal = await kv.get(realKey);
+          if (!oldVal) return new Response("订阅不存在", { status: 404 });
+          oldItem = JSON.parse(oldVal);
         } else {
-          realKey = Array.from({ length: 8 }, () =>
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(Math.random() * 62)]
-          ).join("");
+          // 新增时随机生成 8 位独立 Key
+          realKey = Array.from({ length: 8 }, () => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(Math.random() * 62)]).join('');
         }
 
         const displayName = url.searchParams.get("displayName") || "未命名";
@@ -152,47 +103,26 @@ export default {
         const days = parseInt(url.searchParams.get("days"), 10) || 0;
 
         const now = Date.now();
-        const expire = days > 0
-          ? now + days * 86400000
-          : (path === "/update" ? oldItem?.expire : null);
-
-        const item = {
-          realKey,
-          displayName,
-          content,
-          expire,
-          note,
-          created: oldItem?.created || now
-        };
+        const expire = days > 0 ? now + days * 86400000 : (path === "/update" ? oldItem?.expire : null);
+        const item = { realKey, displayName, content, expire, note, created: oldItem?.created || now };
 
         await kv.put(realKey, JSON.stringify(item));
-
-        await sendTG(env, path === "/save" ? "🟢 新增订阅" : "🟡 更新订阅", {
-          "名称": displayName,
-          "Key": realKey,
-          "有效期": expire ? `${Math.ceil((expire - now) / 86400000)}天` : "永久",
-          "备注": note || "无"
-        });
-
-        return new Response(path === "/save" ? "保存成功" : "更新成功");
+        await sendTG(env, path === "/save" ? "🟢 新增订阅节点" : "🟡 更新订阅节点", { "订阅名称": item.displayName, "提取 🔑": item.realKey, "时效状态": item.expire ? `${Math.ceil((item.expire - Date.now()) / 86400000)} 天` : "永久有效", "节点备注": item.note || "无" });
+        return new Response(path === "/save" ? `订阅 "${displayName}" 保存成功` : "订阅更新成功");
       }
 
-      // ========== 删除订阅 ==========
+      // 删除
       if (path === "/delete") {
-        const key = url.searchParams.get("key") || "";
-        const old = await kv.get(key);
-        const item = old ? JSON.parse(old) : null;
+        const delKey = url.searchParams.get("key") || "";
+        const oldVal = await kv.get(delKey);
+        const oldItemObj = oldVal ? JSON.parse(oldVal) : null;
 
-        await kv.delete(key);
-
-        await sendTG(env, "🔴 删除订阅", {
-          "名称": item?.displayName || "未知",
-          "Key": key
-        });
-
+        await kv.delete(delKey);
+        await sendTG(env, "🔴 删除订阅节点", { "订阅名称": oldItemObj?.displayName || "未知", "提取 🔑": delKey, "原备注": oldItemObj?.note || "无" });
         return new Response("删除成功");
       }
-      // ========== 📋 订阅列表 ==========
+
+      // 列表获取
       if (path === "/list") {
         const page = parseInt(url.searchParams.get("page"), 10) || 1;
         const search = (url.searchParams.get("search") || "").toLowerCase();
@@ -200,131 +130,53 @@ export default {
         const sortOrder = url.searchParams.get("order") || "asc";
 
         const listKV = await kv.list({ limit: 1000 }).catch(() => ({ keys: [] }));
-        const values = await Promise.all(listKV.keys.map(k => kv.get(k.name)));
+        const rawValues = await Promise.all(listKV.keys.map(k => kv.get(k.name)));
 
-        let items = values.filter(Boolean).map(v => JSON.parse(v)).map(i => ({
-          displayName: i.displayName || "未命名",
-          realKey: i.realKey,
-          remainingDays: i.expire
-            ? (Date.now() > i.expire ? "已过期" : Math.ceil((i.expire - Date.now()) / 86400000))
-            : "∞",
-          note: i.note || "",
-          created: i.created || 0
+        let allItems = rawValues.filter(Boolean).map(v => JSON.parse(v)).map(i => ({
+          displayName: i.displayName || "未命名", realKey: i.realKey,
+          remainingDays: i.expire ? (Date.now() > i.expire ? "已过期" : Math.ceil((i.expire - Date.now()) / 86400000)) : "∞",
+          note: i.note || "", created: i.created || 0
         }));
 
-        // 搜索过滤
-        if (search) {
-          items = items.filter(i =>
-            i.displayName.toLowerCase().includes(search) ||
-            i.realKey.toLowerCase().includes(search) ||
-            i.note.toLowerCase().includes(search)
-          );
-        }
+        if (search) allItems = allItems.filter(i => i.displayName.toLowerCase().includes(search) || i.realKey.toLowerCase().includes(search) || i.note.toLowerCase().includes(search));
 
-        // 排序
-        items.sort((a, b) => {
-          let va = a[sortField];
-          let vb = b[sortField];
-
+        allItems.sort((a, b) => {
+          let va = a[sortField], vb = b[sortField];
           if (sortField === "remainingDays") {
-            const cv = v => v === "∞" ? Infinity : (v === "已过期" ? -1 : Number(v));
-            va = cv(va);
-            vb = cv(vb);
+            const conv = v => v === "∞" ? Infinity : (v === "已过期" ? -1 : Number(v));
+            va = conv(va); vb = conv(vb);
           }
-
-          if (va > vb) return sortOrder === "asc" ? 1 : -1;
-          if (va < vb) return sortOrder === "asc" ? -1 : 1;
-          return 0;
+          return va > vb ? (sortOrder === "asc" ? 1 : -1) : (sortOrder === "asc" ? -1 : 1);
         });
 
-        const totalPages = Math.max(1, Math.ceil(items.length / 10));
-
-        return new Response(JSON.stringify({
-          page,
-          totalPages,
-          items: items.slice((page - 1) * 10, page * 10)
-        }), {
-          headers: {
-            "Content-Type": "application/json;charset=UTF-8"
-          }
-        });
+        return new Response(JSON.stringify({ page, totalPages: Math.max(1, Math.ceil(allItems.length / 10)), items: allItems.slice((page - 1) * 10, page * 10) }), { headers: { "Content-Type": "application/json" } });
       }
 
-      return new Response("Not Found", { status: 404 });
-
     } catch (err) {
-      return new Response(
-        "Worker 内部错误: " + (err?.message || String(err)),
-        { status: 500 }
-      );
+      return new Response("Worker 内部错误: " + (err?.message || String(err)), { status: 500 });
     }
   }
 };
 
-
-// ========== Base64 编码（支持中文） ==========
+// -------------------- 通用工具函数 --------------------
 function safeBtoa(str) {
-  try {
-    return btoa(
-      encodeURIComponent(str).replace(
-        /%([0-9A-F]{2})/g,
-        (_, p1) => String.fromCharCode(parseInt(p1, 16))
-      )
-    );
-  } catch {
-    return btoa(str);
-  }
+  try { return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (_, p1) => String.fromCharCode(parseInt(p1, 16)))); } catch { return btoa(str); }
 }
 
-
-// ========== Telegram 通知 ==========
 async function sendTG(env, title, fields = {}) {
-  const token = env.TELEGRAM_BOT_TOKEN;
-  const chatId = env.TELEGRAM_CHAT_ID;
-
+  const token = env.TELEGRAM_BOT_TOKEN, chatId = env.TELEGRAM_CHAT_ID;
   if (!token || !chatId) return;
 
-  const time = new Date()
-    .toLocaleString("zh-CN", {
-      timeZone: "Asia/Shanghai",
-      hour12: false
-    })
-    .replace(/\//g, "-");
+  const timeStr = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }).replace(/\//g, "-");
+  const esc = t => String(t || "").replace(/([_*\[\]()~`>#+=\-|{}.!])/g, "\\$1");
+  const bodyLines = Object.entries(fields).filter(([_, v]) => v).map(([k, v]) => `${k} : ${v}`).join("\n");
 
-  const escape = t =>
-    String(t || "").replace(
-      /([_*\[\]()~`>#+=\-|{}.!])/g,
-      "\\$1"
-    );
-
-  const body = Object.entries(fields)
-    .filter(([_, v]) => v)
-    .map(([k, v]) => `${k}: ${v}`)
-    .join("\n");
-
-  const text =
-`*${escape(title)}*
-⏰ ${escape(time)}
-
-${body}`;
-
-  await fetch(
-    `https://api.telegram.org/bot${token}/sendMessage`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        parse_mode: "MarkdownV2",
-        disable_notification: true
-      })
-    }
-  ).catch(() => {});
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text: `*${esc(title)}*\n*⏰ 时间:* \`${esc(timeStr)}\`\n\`\`\`\n${bodyLines}\n\`\`\``, parse_mode: "MarkdownV2", disable_notification: true })
+  }).catch(() => {});
 }
-
 // ========== 前端 UI 管理页面 HTML ==========
 function generateHTML(env) {
   return `<!DOCTYPE html>
