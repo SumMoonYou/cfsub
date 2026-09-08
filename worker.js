@@ -1,76 +1,111 @@
 /**
+ * ============================================================
  * Cloudflare Worker - 节点订阅管理系统
+ * ============================================================
  *
- * 功能概览：
- *   1. 管理节点订阅（新增 / 更新 / 删除 / 列表 / 详情）
+ * 【功能概览】
+ *   1. 节点订阅的新增、更新、删除、列表、详情
  *   2. 通过 /get/{key}/{token} 下发订阅内容（双重密钥保护）
- *   3. 仅允许中国大陆（CN）IP 访问订阅
- *   4. 客户端 UA 白名单校验
- *   5. 同 Key + 同 IP 60 秒访问频率限制
- *   6. 所有管理操作与订阅访问均推送 Telegram 通知
- *   7. 使用 NODES_KV 存储数据
- *   8. 前端管理页面支持：
+ *   3. 仅允许中国大陆（CN）IP 访问订阅接口
+ *   4. 客户端 User-Agent 白名单校验
+ *   5. 同一 Key + 同一 IP 60 秒访问频率限制
+ *   6. 所有管理操作与订阅访问均可推送 Telegram 通知
+ *   7. 前端管理页面支持：
  *        - 算术验证码登录
- *        - 刷新/关闭浏览器自动退出（sessionStorage）
+ *        - 关闭浏览器/标签页自动退出（sessionStorage）
  *        - 5 分钟无操作自动退出
- *        - 双重密钥链接一键复制
+ *        - 响应式布局（手机端卡片，桌面端表格）
+ *   8. 统一简约错误页面（与主题同色系）
+ *
+ * 【环境变量】
+ *   NODES_KV              必须绑定（KV 命名空间）
+ *   ADMIN_PASSWORD        可选，默认 "admin123"
+ *   TELEGRAM_BOT_TOKEN    可选，为空则不发送任何通知
+ *   TELEGRAM_CHAT_ID      可选，为空则不发送任何通知
+ *   DEFAULT_EXPIRE_DAYS   可选，默认 0（新建时未填天数使用此值，0=永久）
+ *   PAGE_SIZE             可选，默认 10（列表每页显示条数）
+ *
+ * 【订阅链接格式】
+ *   https://你的域名/get/{12位key}/{16位token}
+ * ============================================================
  */
 
 export default {
+  /**
+   * Worker 入口函数
+   * @param {Request} request  请求对象
+   * @param {object}  env      环境变量与绑定
+   */
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
       const path = url.pathname;
       const kv = env.NODES_KV;
 
-      // ---------- 路径白名单 ----------
+      // ================================================================
+      // 一、读取环境变量并设置默认值
+      // ================================================================
+      const ADMIN_PASSWORD = env.ADMIN_PASSWORD || "admin123";           // 管理员密码
+      const TG_TOKEN = env.TELEGRAM_BOT_TOKEN || "";                     // Telegram Bot Token
+      const TG_CHAT_ID = env.TELEGRAM_CHAT_ID || "";                     // Telegram 聊天 ID
+      const DEFAULT_EXPIRE_DAYS = parseInt(env.DEFAULT_EXPIRE_DAYS, 10) || 0; // 默认有效天数
+      const PAGE_SIZE = parseInt(env.PAGE_SIZE, 10) || 10;               // 列表每页条数
+
+      // ================================================================
+      // 二、路径白名单校验
+      // 只允许以下路径，其余一律返回 404 错误页
+      // ================================================================
       const allowedPaths = [
-        "/",
-        "/login",
-        "/save",
-        "/update",
-        "/delete",
-        "/list",
-        "/detail",
+        "/",          // 管理后台首页
+        "/login",     // 登录验证
+        "/save",      // 新增订阅
+        "/update",    // 更新订阅
+        "/delete",    // 删除订阅
+        "/list",      // 订阅列表
+        "/detail",    // 订阅详情
       ];
       if (!allowedPaths.includes(path) && !path.startsWith("/get/")) {
-        return new Response("Not Found", { status: 404 });
+        return errorPage(404, "页面不存在");
       }
 
-      // ---------- 检查 KV 绑定 ----------
+      // 必须绑定 NODES_KV，否则无法存储数据
       if (!kv) {
-        return new Response("未绑定 NODES_KV", { status: 500 });
+        return errorPage(500, "未绑定 NODES_KV");
       }
 
-      // ---------- 获取客户端信息 ----------
+      // ================================================================
+      // 三、获取客户端基础信息（用于日志与通知）
+      // ================================================================
       const ua = request.headers.get("user-agent") || "未知设备";
       const ip = (
-        request.headers.get("cf-connecting-ip") ||
-        request.headers.get("x-forwarded-for") ||
+        request.headers.get("cf-connecting-ip") ||   // Cloudflare 真实 IP
+        request.headers.get("x-forwarded-for") ||    // 兼容其他代理
         "未知IP"
       )
-        .split(",")[0]
+        .split(",")[0]   // 取第一个 IP（防止多级代理）
         .trim();
 
-      // ---------- 解析 IP 地理位置 ----------
+      // 解析 IP 地理位置（国内源优先，失败则回退）
       const ipInfo = await getIPLocation(ip, request.cf || {});
       const cfLocation = ipInfo.location;
 
-      // =====================================================
-      // 订阅获取接口：/get/{key}/{token}（双重密钥）
-      // =====================================================
+      // ================================================================
+      // 四、订阅获取接口：/get/{key}/{token}
+      // 必须同时提供正确的 key 和 token 才能获取订阅内容
+      // ================================================================
       if (path.startsWith("/get/")) {
+        // 解析路径参数：/get/xxx/yyy → ["xxx", "yyy"]
         const parts = path.slice(5).split("/").filter(Boolean);
 
-        // 必须同时提供 key 和 token
+        // 路径格式必须是 /get/{key}/{token}
         if (parts.length < 2) {
-          return new Response("缺少密钥", { status: 400 });
+          return errorPage(400, "缺少密钥");
         }
 
-        const realKey = parts[0];
-        const providedToken = parts[1];
+        const realKey = parts[0];          // 订阅唯一标识
+        const providedToken = parts[1];    // 用户提供的 token
 
-        // 允许的客户端 UA 关键词
+        // 允许的客户端 UA 关键词（不区分大小写）
         const uaList = [
           "clash",
           "quantumult",
@@ -86,74 +121,67 @@ export default {
         ];
         const clientUA = ua.toLowerCase();
 
-        // 地区限制：仅允许中国大陆
+        // ---------- 4.1 地区限制：仅允许中国大陆 ----------
         if ((request.cf?.country || "") !== "CN") {
-          return new Response("当前区域不支持访问", {
-            status: 403,
-            headers: { "Content-Type": "text/plain;charset=UTF-8" },
-          });
+          return errorPage(403, "当前区域不支持访问");
         }
 
-        // UA 白名单检测
+        // ---------- 4.2 UA 白名单检测 ----------
         if (!uaList.some((x) => clientUA.includes(x))) {
-          await sendTG(env, "❌ 订阅访问被拦截（非法客户端）", {
+          // 非法客户端访问，推送告警
+          await sendTG(TG_TOKEN, TG_CHAT_ID, "❌ 订阅访问被拦截（非法客户端）", {
             "提取 🔑": `${realKey.slice(0, 4)}****${realKey.slice(-4)}`,
             "访问位置": cfLocation,
             "IP 地址": ip,
             "客户端 UA": ua,
           });
-          return new Response("未授权客户端", { status: 403 });
+          return errorPage(403, "未授权客户端");
         }
 
-        // ---------- 访问频率限制（同 Key + 同 IP 60 秒一次） ----------
+        // ---------- 4.3 访问频率限制（同 Key + 同 IP 60 秒一次） ----------
         const limitKey = `limit:${realKey}:${ip}`;
         if (await kv.get(limitKey)) {
-          return new Response("请求过于频繁，请60秒后再试", {
-            status: 429,
-            headers: {
-              "Content-Type": "text/plain;charset=UTF-8",
-              "Retry-After": "60",
-            },
-          });
+          return errorPage(429, "请求过于频繁，请60秒后再试");
         }
+        // 写入限制标记，60 秒后自动过期
         await kv.put(limitKey, "1", { expirationTtl: 60 });
 
-        // ---------- 读取订阅数据 ----------
+        // ---------- 4.4 读取订阅数据 ----------
         const value = await kv.get(realKey);
         if (!value) {
-          return new Response("订阅不存在", { status: 404 });
+          return errorPage(404, "订阅不存在");
         }
 
         let item;
         try {
           item = JSON.parse(value);
         } catch {
-          return new Response("订阅数据异常", { status: 500 });
+          return errorPage(500, "订阅数据异常");
         }
 
-        // ---------- 验证 token（双重密钥核心） ----------
+        // ---------- 4.5 验证 token（双重密钥核心） ----------
         if (!item.token || item.token !== providedToken) {
-          await sendTG(env, "❌ 订阅访问被拦截（Token错误）", {
+          await sendTG(TG_TOKEN, TG_CHAT_ID, "❌ 订阅访问被拦截（Token错误）", {
             "提取 🔑": `${realKey.slice(0, 4)}****${realKey.slice(-4)}`,
             "访问位置": cfLocation,
             "IP 地址": ip,
             "客户端 UA": ua,
           });
-          return new Response("密钥错误", { status: 403 });
+          return errorPage(403, "密钥错误");
         }
 
-        // ---------- 检查是否过期 ----------
+        // ---------- 4.6 检查订阅是否已过期 ----------
         if (item.expire && Date.now() > item.expire) {
-          await sendTG(env, "⏳ 订阅已过期", {
+          await sendTG(TG_TOKEN, TG_CHAT_ID, "⏳ 订阅已过期", {
             "订阅名称": item.displayName,
             "提取 🔑": `${item.realKey.slice(0, 4)}****${item.realKey.slice(-4)}`,
             "访问位置": cfLocation,
           });
-          return new Response("订阅已过期", { status: 403 });
+          return errorPage(403, "订阅已过期");
         }
 
-        // ---------- 正常访问通知 ----------
-        await sendTG(env, "🧭 订阅节点被访问", {
+        // ---------- 4.7 正常访问，发送通知 ----------
+        await sendTG(TG_TOKEN, TG_CHAT_ID, "🧭 订阅节点被访问", {
           "订阅名称": item.displayName,
           "提取 🔑": `${item.realKey.slice(0, 4)}****${item.realKey.slice(-4)}`,
           "访问位置": ipInfo.location,
@@ -163,34 +191,36 @@ export default {
           "客户端 UA": ua,
         });
 
-        // ---------- 返回 Base64 编码的订阅内容 ----------
+        // ---------- 4.8 返回 Base64 编码后的订阅内容 ----------
         return new Response(safeBtoa(item.content), {
           headers: {
             "Content-Type": "text/plain;charset=UTF-8",
-            "Cache-Control": "no-store",
+            "Cache-Control": "no-store", // 禁止缓存，保证内容实时
           },
         });
       }
 
-      // =====================================================
-      // 首页（管理后台页面）
-      // =====================================================
+      // ================================================================
+      // 五、首页：返回管理后台 HTML 页面
+      // ================================================================
       if (path === "/") {
         return new Response(generateHTML(), {
           headers: { "Content-Type": "text/html;charset=UTF-8" },
         });
       }
 
-      // =====================================================
-      // 登录验证
-      // =====================================================
+      // ================================================================
+      // 六、登录验证接口
+      // ================================================================
       const password = url.searchParams.get("password");
 
       if (path === "/login") {
-        const ok = password === env.ADMIN_PASSWORD;
+        const ok = password === ADMIN_PASSWORD;
 
+        // 无论成功失败都推送通知，方便监控异常登录尝试
         await sendTG(
-          env,
+          TG_TOKEN,
+          TG_CHAT_ID,
           ok ? "🔓 管理员登录成功" : "🔒 管理员登录失败",
           {
             [ok ? "登录位置" : "尝试位置"]: cfLocation,
@@ -199,73 +229,92 @@ export default {
           }
         );
 
+        // 登录接口返回纯文本，方便前端 JS 判断 status
         return new Response(ok ? "登录成功" : "密码错误", {
           status: ok ? 200 : 403,
         });
       }
 
-      // ---------- 管理接口统一鉴权 ----------
-      if (password !== env.ADMIN_PASSWORD) {
-        return new Response("越权访问被拒绝", { status: 403 });
+      // ================================================================
+      // 七、管理接口统一鉴权
+      // 除 /login 和 /get/ 外，所有管理接口都必须携带正确密码
+      // ================================================================
+      if (password !== ADMIN_PASSWORD) {
+        return errorPage(403, "越权访问被拒绝");
       }
 
-      // =====================================================
-      // 获取订阅详情
-      // =====================================================
+      // ================================================================
+      // 八、获取单个订阅详情（编辑时使用）
+      // ================================================================
       if (path === "/detail") {
         const key = url.searchParams.get("key") || "";
         const value = await kv.get(key);
+
         return value
           ? new Response(value, {
               headers: { "Content-Type": "application/json;charset=UTF-8" },
             })
-          : new Response("订阅不存在", { status: 404 });
+          : errorPage(404, "订阅不存在");
       }
 
-      // =====================================================
-      // 新增 / 更新订阅
-      // =====================================================
+      // ================================================================
+      // 九、新增或更新订阅
+      // ================================================================
       if (path === "/save" || path === "/update") {
+        // 订阅内容从请求体读取
         const content = await request.text();
         if (!content) {
-          return new Response("缺少内容", { status: 400 });
+          return errorPage(400, "缺少内容");
         }
 
         let key = url.searchParams.get("key");
         let old = null;
 
-        // 更新模式必须提供已存在的 key
+        // 更新模式：必须提供已存在的 key
         if (path === "/update" && key) {
           const oldVal = await kv.get(key);
           if (!oldVal) {
-            return new Response("订阅不存在", { status: 404 });
+            return errorPage(404, "订阅不存在");
           }
           old = JSON.parse(oldVal);
         } else {
-          // 新增：生成 12 位随机 key
+          // 新增模式：生成 12 位随机 key
           key = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
         }
 
-        // 生成或保留 16 位 token（双重密钥）
+        // 生成或保留 16 位 token
+        // 更新时保留原 token，避免已有订阅链接失效
         const token =
           old?.token || crypto.randomUUID().replace(/-/g, "").slice(0, 16);
 
         const now = Date.now();
-        const days = parseInt(url.searchParams.get("days"), 10) || 0;
+        // 优先使用前端传的天数，否则使用环境变量默认值
+        const daysParam = parseInt(url.searchParams.get("days"), 10);
+        const finalDays = Number.isNaN(daysParam)
+          ? DEFAULT_EXPIRE_DAYS
+          : daysParam;
 
+        // 组装存储对象
         const item = {
-          realKey: key,
-          token: token,
-          displayName: url.searchParams.get("displayName") || "未命名",
-          content,
-          expire: days > 0 ? now + days * 86400000 : old?.expire || null,
-          created: old?.created || now,
+          realKey: key,                                                    // 唯一标识
+          token: token,                                                    // 双重密钥
+          displayName: url.searchParams.get("displayName") || "未命名",    // 显示名称
+          content: content,                                                // 订阅原始内容
+          // 天数 > 0 时设置过期时间，否则保持原过期时间或永久
+          expire:
+            finalDays > 0
+              ? now + finalDays * 86400000
+              : old?.expire || null,
+          created: old?.created || now,                                    // 创建时间
         };
 
+        // 写入 KV
         await kv.put(key, JSON.stringify(item));
 
+        // 推送操作通知
         await sendTG(
-          env,
+          TG_TOKEN,
+          TG_CHAT_ID,
           path === "/save" ? "🟢 新增订阅节点" : "🟡 更新订阅节点",
           {
             "订阅名称": item.displayName,
@@ -277,9 +326,9 @@ export default {
         return new Response(path === "/save" ? "保存成功" : "更新成功");
       }
 
-      // =====================================================
-      // 删除订阅
-      // =====================================================
+      // ================================================================
+      // 十、删除订阅
+      // ================================================================
       if (path === "/delete") {
         const key = url.searchParams.get("key") || "";
         const oldVal = await kv.get(key);
@@ -287,7 +336,7 @@ export default {
 
         await kv.delete(key);
 
-        await sendTG(env, "🔴 删除订阅节点", {
+        await sendTG(TG_TOKEN, TG_CHAT_ID, "🔴 删除订阅节点", {
           "订阅名称": old?.displayName || "未知",
           "提取 🔑": key,
         });
@@ -295,17 +344,21 @@ export default {
         return new Response("删除成功");
       }
 
-      // =====================================================
-      // 订阅列表（分页 + 搜索）
-      // =====================================================
+      // ================================================================
+      // 十一、订阅列表（支持分页与关键词搜索）
+      // ================================================================
       if (path === "/list") {
         const page = parseInt(url.searchParams.get("page"), 10) || 1;
         const search = (url.searchParams.get("search") || "").toLowerCase();
 
-        // 最多读取 1000 条
+        // 最多读取 1000 条（Cloudflare KV list 限制）
         const list = await kv.list({ limit: 1000 }).catch(() => ({ keys: [] }));
-        const values = await Promise.all(list.keys.map((k) => kv.get(k.name)));
+        // 并行读取所有 value，提高性能
+        const values = await Promise.all(
+          list.keys.map((k) => kv.get(k.name))
+        );
 
+        // 转换为前端需要的数据结构
         let items = values
           .filter(Boolean)
           .map((v) => JSON.parse(v))
@@ -314,6 +367,7 @@ export default {
             realKey: i.realKey,
             token: i.token || "",
             created: i.created || 0,
+            // 计算剩余天数：已过期 / 永久 / 具体天数
             remainingDays: i.expire
               ? Date.now() > i.expire
                 ? "已过期"
@@ -321,7 +375,7 @@ export default {
               : "∞",
           }));
 
-        // 关键词过滤
+        // 关键词过滤（匹配名称或 key）
         if (search) {
           items = items.filter(
             (i) =>
@@ -330,14 +384,15 @@ export default {
           );
         }
 
-        // 默认按名称排序
+        // 默认按显示名称排序
         items.sort((a, b) => a.displayName.localeCompare(b.displayName));
 
+        // 使用 PAGE_SIZE 进行分页裁剪
         return new Response(
           JSON.stringify({
             page,
-            totalPages: Math.max(1, Math.ceil(items.length / 10)),
-            items: items.slice((page - 1) * 10, page * 10),
+            totalPages: Math.max(1, Math.ceil(items.length / PAGE_SIZE)),
+            items: items.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
           }),
           {
             headers: { "Content-Type": "application/json;charset=UTF-8" },
@@ -345,31 +400,134 @@ export default {
         );
       }
 
+      // 默认响应（理论上不会走到这里）
       return new Response("OK");
     } catch (e) {
-      return new Response("Worker错误:" + e.message, { status: 500 });
+      // 捕获所有未处理异常，返回统一错误页，避免 Worker 直接崩溃
+      return errorPage(500, "服务器错误：" + e.message);
     }
   },
 };
 
 /* ============================================================
- * 工具函数
+ * 统一错误页面
+ * 简约居中卡片风格，与管理后台同色系
+ * @param {number} status   HTTP 状态码
+ * @param {string} message  错误提示文案
+ * ============================================================ */
+function errorPage(status, message) {
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>${status} - ${message}</title>
+  <link rel="icon" href="https://img.helo.de5.net/1788870746264.jpg" type="image/jpeg">
+  <style>
+    :root {
+      --primary: #3b82f6;
+      --bg: #f1f5f9;
+      --card: #ffffff;
+      --text: #1e293b;
+      --text-secondary: #64748b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      -webkit-font-smoothing: antialiased;
+    }
+    .card {
+      background: var(--card);
+      border-radius: 16px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.06);
+      padding: 40px 32px;
+      text-align: center;
+      max-width: 380px;
+      width: 100%;
+    }
+    .code {
+      font-size: 64px;
+      font-weight: 700;
+      color: var(--primary);
+      line-height: 1;
+      margin-bottom: 12px;
+      letter-spacing: -2px;
+    }
+    .msg {
+      font-size: 16px;
+      color: var(--text-secondary);
+      margin-bottom: 28px;
+      line-height: 1.5;
+    }
+    .btn {
+      display: inline-block;
+      background: linear-gradient(135deg, #3b82f6, #2563eb);
+      color: white;
+      text-decoration: none;
+      padding: 12px 28px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      box-shadow: 0 4px 14px rgba(37,99,235,0.3);
+      transition: transform 0.15s, opacity 0.15s;
+    }
+    .btn:active {
+      transform: scale(0.97);
+      opacity: 0.9;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="code">${status}</div>
+    <div class="msg">${message}</div>
+    <a class="btn" href="/">返回首页</a>
+  </div>
+</body>
+</html>`;
+
+  return new Response(html, {
+    status,
+    headers: {
+      "Content-Type": "text/html;charset=UTF-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+/* ============================================================
+ * 工具函数区域
  * ============================================================ */
 
 /**
  * IP 地理位置解析
- * 优先级：ip9.com.cn → ip-api.com → Cloudflare cf 信息
+ * 优先级：
+ *   1. ip9.com.cn（国内优先，速度较快）
+ *   2. ip-api.com（国际备用）
+ *   3. Cloudflare 自带的 request.cf 信息（最终兜底）
+ *
+ * @param {string} ip  客户端 IP
+ * @param {object} cf  Cloudflare request.cf 对象
+ * @returns {object}   { location, isp, asn, source }
  */
 async function getIPLocation(ip, cf = {}) {
-  // 1. 优先国内源
+  // ---------- 1. 优先使用国内源 ----------
   try {
     const res = await fetch(`https://ip9.com.cn/get?ip=${ip}`, {
       headers: { "User-Agent": "Cloudflare-Worker" },
-      signal: AbortSignal.timeout(3000),
+      signal: AbortSignal.timeout(3000), // 3 秒超时
     });
     if (!res.ok) throw new Error();
     const json = await res.json();
     if (json.ret !== 200 || !json.data) throw new Error();
+
     const d = json.data;
     return {
       location: [d.country, d.prov, d.city, d.area].filter(Boolean).join(" "),
@@ -377,9 +535,11 @@ async function getIPLocation(ip, cf = {}) {
       asn: "",
       source: "ip9",
     };
-  } catch {}
+  } catch {
+    // 忽略错误，继续尝试下一个源
+  }
 
-  // 2. 国际备用源
+  // ---------- 2. 国际备用源 ----------
   try {
     const res = await fetch(
       `http://ip-api.com/json/${ip}?fields=status,message,country,regionName,city,isp,as,org`,
@@ -388,15 +548,18 @@ async function getIPLocation(ip, cf = {}) {
     if (!res.ok) throw new Error();
     const d = await res.json();
     if (d.status !== "success") throw new Error();
+
     return {
       location: [d.country, d.regionName, d.city].filter(Boolean).join(" "),
       isp: d.isp || d.org || "Unknown",
       asn: d.as || "",
       source: "ip-api",
     };
-  } catch {}
+  } catch {
+    // 忽略错误，继续使用 Cloudflare 信息
+  }
 
-  // 3. Cloudflare 兜底
+  // ---------- 3. Cloudflare 兜底 ----------
   const parts = [cf.country, cf.city].filter(Boolean);
   return {
     location: parts.length ? parts.join(" ") : "Unknown",
@@ -407,7 +570,12 @@ async function getIPLocation(ip, cf = {}) {
 }
 
 /**
- * 安全 Base64 编码（兼容中文等特殊字符）
+ * 安全 Base64 编码
+ * 先对字符串进行 URI 编码，再转 Base64，
+ * 避免中文等特殊字符导致 btoa 失败
+ *
+ * @param {string} str  原始字符串
+ * @returns {string}    Base64 编码结果
  */
 function safeBtoa(str) {
   try {
@@ -417,18 +585,25 @@ function safeBtoa(str) {
       )
     );
   } catch {
+    // 极端情况下回退到普通 btoa
     return btoa(str);
   }
 }
 
 /**
- * 发送 Telegram 通知（MarkdownV2）
+ * 发送 Telegram 通知
+ * 如果 token 或 chatId 为空，直接跳过，不影响主流程
+ *
+ * @param {string} token   Bot Token
+ * @param {string} chatId  聊天 ID
+ * @param {string} title   消息标题
+ * @param {object} fields  键值对内容（自动过滤空值）
  */
-async function sendTG(env, title, fields = {}) {
-  const token = env.TELEGRAM_BOT_TOKEN;
-  const chatId = env.TELEGRAM_CHAT_ID;
+async function sendTG(token, chatId, title, fields = {}) {
+  // 未配置 Telegram 时静默跳过
   if (!token || !chatId) return;
 
+  // 生成上海时区时间字符串
   const timeStr = new Date()
     .toLocaleString("zh-CN", {
       timeZone: "Asia/Shanghai",
@@ -440,11 +615,13 @@ async function sendTG(env, title, fields = {}) {
   const esc = (t) =>
     String(t || "").replace(/([_*\[\]()~`>#+=\-|{}.!])/g, "\\$1");
 
+  // 组装消息正文
   const bodyLines = Object.entries(fields)
     .filter(([_, v]) => v)
     .map(([k, v]) => `${k} : ${esc(v)}`)
     .join("\n");
 
+  // 发送消息（失败时静默忽略，避免影响主业务）
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -457,175 +634,420 @@ async function sendTG(env, title, fields = {}) {
 ${bodyLines}
 \`\`\``,
       parse_mode: "MarkdownV2",
-      disable_notification: true,
+      disable_notification: true, // 静默通知，不打断用户
     }),
   }).catch(() => {});
 }
 
 /**
- * 生成前端管理页面
+ * 生成前端管理页面 HTML
+ * 包含登录、验证码、列表、新增/编辑、响应式布局等全部前端逻辑
  */
 function generateHTML() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <title>节点订阅管理</title>
-  <link rel="icon" href="https://img.helo.de5.net/1786604634282.ico" type="image/x-icon">
+  <!-- 网站图标 -->
+  <link rel="icon" href="https://img.helo.de5.net/1788870746264.jpg" type="image/jpeg">
   <style>
+    /* -------------------- CSS 变量（方便统一调整主题色） -------------------- */
+    :root {
+      --primary: #3b82f6;
+      --primary-dark: #2563eb;
+      --bg: #f1f5f9;
+      --card: #ffffff;
+      --text: #1e293b;
+      --text-secondary: #64748b;
+      --border: #e2e8f0;
+      --radius: 14px;
+      --shadow: 0 4px 20px rgba(0,0,0,0.06);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      margin: 0; padding: 0; background: #f0f2f5;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
     }
+
     .container {
-      max-width: 900px; margin: 20px auto; padding: 24px;
-      background: #fff; border-radius: 16px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 16px;
     }
-    input, textarea, select, button {
-      font-size: 14px; margin: 6px 0; padding: 11px 14px;
-      border-radius: 10px; border: 1px solid #d9d9d9;
-      width: 100%; box-sizing: border-box; transition: all 0.2s;
+
+    /* -------------------- 头部 -------------------- */
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 4px 20px;
+    }
+    .header h1 {
+      font-size: 1.35rem;
+      font-weight: 700;
+    }
+    .logout-btn {
+      background: linear-gradient(135deg, #f87171, #ef4444);
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      box-shadow: 0 4px 12px rgba(239,68,68,0.25);
+      display: none;
+      align-items: center;
+    }
+    .logout-btn:active { transform: scale(0.97); }
+
+    /* -------------------- 卡片容器 -------------------- */
+    .card {
+      background: var(--card);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+
+    /* -------------------- 表单元素 -------------------- */
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+      margin-top: 14px;
+    }
+    label:first-child { margin-top: 0; }
+
+    input, textarea, select {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      font-size: 15px;
+      background: #fff;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      -webkit-appearance: none;
     }
     input:focus, textarea:focus, select:focus {
-      outline: none; border-color: #4facfe;
-      box-shadow: 0 0 0 3px rgba(79,172,254,0.15);
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(59,130,246,0.15);
     }
-    button {
-      background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-      color: #fff; border: none; cursor: pointer; font-weight: 500;
+    textarea { resize: vertical; min-height: 110px; }
+
+    /* -------------------- 主按钮 -------------------- */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      padding: 13px;
+      border: none;
+      border-radius: 10px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      margin-top: 16px;
     }
-    button:hover:not(:disabled) { opacity: 0.92; transform: translateY(-1px); }
-    button:disabled {
-      background: #ccc; cursor: not-allowed; opacity: 0.7; transform: none;
+    .btn-primary {
+      background: linear-gradient(135deg, #3b82f6, #2563eb);
+      color: white;
+      box-shadow: 0 4px 14px rgba(37,99,235,0.3);
     }
-    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
-    th, td { border: 1px solid #eee; padding: 10px 8px; text-align: center; }
-    th { background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); color: #fff; }
-    .copy-btn { background: #00c1ff; color: #fff; padding: 5px 10px; border: none; border-radius: 6px; cursor: pointer; font-size: 12px; }
-    .edit-btn { background: #ffa500; color: #fff; }
-    .delete-btn { background: #ff5c5c; color: #fff; }
-    .logout-btn {
-      background: linear-gradient(135deg, #ff6b6b 0%, #ee5a5a 100%);
-      width: auto; padding: 8px 18px; border-radius: 20px; font-size: 13px;
-      box-shadow: 0 4px 12px rgba(238,90,90,0.3); display: none; align-items: center;
+    .btn-primary:active { transform: scale(0.98); }
+    .btn-primary:disabled {
+      background: #cbd5e1;
+      box-shadow: none;
+      cursor: not-allowed;
     }
-    .logout-btn:hover { box-shadow: 0 6px 16px rgba(238,90,90,0.4); }
-    .pagination { margin-top: 14px; text-align: center; }
-    .pagination button { width: auto; padding: 6px 12px; margin: 0 3px; border-radius: 8px; }
-    .search-sort { margin-top: 12px; display: flex; gap: 10px; flex-wrap: wrap; }
-    .search-sort * { flex: 1; min-width: 100px; }
-    .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-    .header-row h2 { margin: 0; font-size: 22px; color: #1a1a1a; }
-    .captcha-box { display: flex; align-items: center; gap: 12px; margin: 10px 0; }
-    .captcha-question {
-      background: #f5f7fa; border: 1px dashed #4facfe; border-radius: 10px;
-      padding: 10px 16px; font-size: 18px; font-weight: 600; color: #333;
-      min-width: 100px; text-align: center; user-select: none; letter-spacing: 2px;
+
+    /* -------------------- 验证码区域 -------------------- */
+    .captcha-row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-top: 6px;
+    }
+    .captcha-q {
+      flex: 1;
+      background: #f8fafc;
+      border: 1.5px dashed #93c5fd;
+      border-radius: 10px;
+      padding: 12px;
+      text-align: center;
+      font-size: 18px;
+      font-weight: 700;
+      color: #1e40af;
+      user-select: none;
+      letter-spacing: 1px;
     }
     .captcha-refresh {
-      background: #e8f4ff; color: #4facfe; border: 1px solid #4facfe;
-      width: auto; padding: 8px 12px; border-radius: 8px; font-size: 13px; cursor: pointer;
+      background: #eff6ff;
+      color: var(--primary);
+      border: 1.5px solid #93c5fd;
+      padding: 12px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      white-space: nowrap;
     }
-    .captcha-refresh:hover { background: #4facfe; color: #fff; }
-    @media (max-width: 600px) {
-      .search-sort { flex-direction: column; }
-      .container { margin: 12px; padding: 16px; }
+    .captcha-refresh:active { background: #dbeafe; }
+
+    /* -------------------- 搜索栏 -------------------- */
+    .search-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 4px;
+    }
+    .search-bar input { flex: 2; min-width: 140px; }
+    .search-bar select { flex: 1; min-width: 100px; }
+    .search-bar .btn { flex: 1; min-width: 90px; margin-top: 0; padding: 12px; }
+
+    /* -------------------- 列表标题 -------------------- */
+    .list-header {
+      font-size: 16px;
+      font-weight: 600;
+      margin: 8px 0 12px;
+    }
+
+    /* -------------------- 桌面端表格 -------------------- */
+    .desktop-table {
+      width: 100%;
+      border-collapse: collapse;
+      display: table;
+    }
+    .desktop-table th {
+      background: #f8fafc;
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 600;
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .desktop-table td {
+      padding: 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 14px;
+      vertical-align: middle;
+    }
+    .desktop-table tr:last-child td { border-bottom: none; }
+
+    /* -------------------- 手机端卡片列表 -------------------- */
+    .mobile-cards { display: none; }
+    .node-card {
+      background: #f8fafc;
+      border-radius: 12px;
+      padding: 14px 16px;
+      margin-bottom: 10px;
+      border: 1px solid var(--border);
+    }
+    .node-card-title {
+      font-weight: 600;
+      font-size: 15px;
+      margin-bottom: 6px;
+    }
+    .node-card-meta {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-bottom: 12px;
+    }
+    .node-card-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .node-card-actions button {
+      flex: 1;
+      padding: 8px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      color: white;
+    }
+    .btn-copy { background: #0ea5e9; }
+    .btn-edit { background: #f59e0b; }
+    .btn-del  { background: #ef4444; }
+
+    /* -------------------- 分页 -------------------- */
+    .pagination {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 16px;
+    }
+    .pagination button {
+      min-width: 36px;
+      height: 36px;
+      border: 1.5px solid var(--border);
+      background: white;
+      border-radius: 8px;
+      font-size: 14px;
+      cursor: pointer;
+      color: var(--text);
+    }
+    .pagination button:disabled {
+      background: var(--primary);
+      color: white;
+      border-color: var(--primary);
+    }
+
+    /* -------------------- 空状态 -------------------- */
+    .empty {
+      text-align: center;
+      padding: 40px 20px;
+      color: var(--text-secondary);
+      font-size: 14px;
+    }
+
+    /* -------------------- 响应式适配 -------------------- */
+    @media (max-width: 640px) {
+      .container { padding: 12px; }
+      .header h1 { font-size: 1.2rem; }
+      .card { padding: 16px; }
+      .desktop-table { display: none; }   /* 手机隐藏表格 */
+      .mobile-cards { display: block; }   /* 手机显示卡片 */
+      .search-bar { flex-direction: column; }
+      .search-bar input,
+      .search-bar select,
+      .search-bar .btn { width: 100%; min-width: 0; }
+    }
+    @media (min-width: 641px) {
+      .mobile-cards { display: none; }
+      .desktop-table { display: table; }
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <div class="header-row">
-      <h2>节点订阅管理</h2>
+    <!-- 页面头部 -->
+    <div class="header">
+      <h1>节点订阅管理</h1>
       <button id="logoutBtn" class="logout-btn">退出登录</button>
     </div>
 
-    <!-- 登录区域 -->
-    <div id="loginDiv">
-      <label>管理员密码:</label>
-      <input type="password" id="adminPassword" placeholder="请输入密码">
+    <!-- ==================== 登录区域 ==================== -->
+    <div id="loginDiv" class="card">
+      <label>管理员密码</label>
+      <input type="password" id="adminPassword" placeholder="请输入密码" autocomplete="current-password">
 
-      <label>验证码:</label>
-      <div class="captcha-box">
-        <div class="captcha-question" id="captchaQuestion">0 + 0 = ?</div>
+      <label>验证码</label>
+      <div class="captcha-row">
+        <div class="captcha-q" id="captchaQuestion">0 + 0 = ?</div>
         <button type="button" class="captcha-refresh" id="refreshCaptcha">换一张</button>
       </div>
-      <input type="text" id="captchaInput" placeholder="请输入计算结果" maxlength="4" autocomplete="off">
+      <input type="text" id="captchaInput" placeholder="请输入计算结果" maxlength="3" inputmode="numeric" autocomplete="off">
 
-      <button id="loginBtn" disabled>登录</button>
+      <button id="loginBtn" class="btn btn-primary" disabled>登 录</button>
     </div>
 
-    <!-- 主功能区域 -->
+    <!-- ==================== 主功能区域（登录后显示） ==================== -->
     <div id="mainDiv" style="display:none;">
-      <div class="search-sort">
-        <input type="text" id="search" placeholder="搜索名称/Key">
-        <select id="sort">
-          <option value="displayName">名称排序</option>
-          <option value="remainingDays">剩余天数排序</option>
-        </select>
-        <select id="order">
-          <option value="asc">升序</option>
-          <option value="desc">降序</option>
-        </select>
-        <button id="searchBtn">搜索/排序</button>
+      <!-- 搜索与排序 -->
+      <div class="card">
+        <div class="search-bar">
+          <input type="text" id="search" placeholder="搜索名称或 Key">
+          <select id="sort">
+            <option value="displayName">按名称</option>
+            <option value="remainingDays">按剩余天数</option>
+          </select>
+          <select id="order">
+            <option value="asc">升序</option>
+            <option value="desc">降序</option>
+          </select>
+          <button id="searchBtn" class="btn btn-primary">搜索</button>
+        </div>
       </div>
 
-      <label>订阅显示名称:</label>
-      <input type="text" id="key" placeholder="如 node1">
+      <!-- 新增 / 编辑表单 -->
+      <div class="card">
+        <label>订阅显示名称</label>
+        <input type="text" id="key" placeholder="例如：家用节点">
 
-      <label>订阅内容:</label>
-      <textarea id="text" rows="5" placeholder="输入订阅节点内容"></textarea>
+        <label>订阅内容</label>
+        <textarea id="text" placeholder="粘贴订阅节点内容"></textarea>
 
-      <label>有效天数 (0 表示永久):</label>
-      <input type="number" id="days" placeholder="例如 7">
+        <label>有效天数（0 = 永久）</label>
+        <input type="number" id="days" placeholder="例如 30" min="0">
 
-      <button id="saveBtn">保存订阅</button>
+        <button id="saveBtn" class="btn btn-primary">保存订阅</button>
+      </div>
 
-      <h3 style="margin-top:24px;margin-bottom:8px;">已保存订阅列表</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>名称</th>
-            <th>剩余天数</th>
-            <th>URL</th>
-            <th>编辑</th>
-            <th>删除</th>
-          </tr>
-        </thead>
-        <tbody id="keylist"></tbody>
-      </table>
-      <div class="pagination" id="pagination"></div>
+      <!-- 订阅列表 -->
+      <div class="card">
+        <div class="list-header">已保存的订阅</div>
+
+        <!-- 桌面端表格 -->
+        <table class="desktop-table">
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>剩余天数</th>
+              <th style="width:90px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="keylist"></tbody>
+        </table>
+
+        <!-- 手机端卡片列表 -->
+        <div class="mobile-cards" id="mobileList"></div>
+
+        <!-- 分页按钮 -->
+        <div class="pagination" id="pagination"></div>
+      </div>
     </div>
   </div>
 
   <script>
-    /* ---------- 全局状态 ---------- */
-    let ADMIN_PASSWORD = '';
-    let currentPage = 1;
-    let currentSearch = '';
-    let currentSort = 'displayName';
-    let currentOrder = 'asc';
-    let currentEditingKey = null;
-    let captchaAnswer = 0;
+    /* ============================================================
+     * 前端全局状态
+     * ============================================================ */
+    let ADMIN_PASSWORD = '';          // 当前登录密码
+    let currentPage = 1;              // 当前页码
+    let currentSearch = '';           // 当前搜索关键词
+    let currentSort = 'displayName';  // 当前排序字段
+    let currentOrder = 'asc';         // 当前排序方向
+    let currentEditingKey = null;     // 正在编辑的 key（null 表示新增模式）
+    let captchaAnswer = 0;            // 当前验证码正确答案
 
-    /* ---------- 无操作自动退出（5分钟） ---------- */
+    /* ---------- 无操作自动退出（5 分钟） ---------- */
     const INACTIVITY_TIMEOUT = 5 * 60 * 1000;
     let inactivityTimer = null;
 
+    /** 重置无操作计时器 */
     function resetInactivityTimer() {
       if (inactivityTimer) clearTimeout(inactivityTimer);
       if (!ADMIN_PASSWORD) return;
       inactivityTimer = setTimeout(() => doLogout(true), INACTIVITY_TIMEOUT);
     }
 
+    /** 监听用户操作事件，用于重置计时器 */
     function setupInactivityListeners() {
-      ['mousemove','mousedown','keydown','touchstart','scroll','click'].forEach(evt => {
-        document.addEventListener(evt, resetInactivityTimer, { passive: true });
+      ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll', 'click'].forEach(e => {
+        document.addEventListener(e, resetInactivityTimer, { passive: true });
       });
     }
 
+    /**
+     * 执行退出登录
+     * @param {boolean} isTimeout  是否为超时自动退出
+     */
     function doLogout(isTimeout = false) {
       sessionStorage.removeItem('adminPassword');
       ADMIN_PASSWORD = '';
@@ -637,20 +1059,24 @@ function generateHTML() {
       document.getElementById('adminPassword').value = '';
       generateCaptcha();
 
-      if (isTimeout) alert('已超过5分钟无操作，已自动退出登录');
+      if (isTimeout) {
+        alert('已超过5分钟无操作，已自动退出登录');
+      }
     }
 
-    /* ---------- 验证码 ---------- */
+    /* ---------- 验证码相关 ---------- */
+
+    /** 生成新的算术验证码（加减法，结果为正数） */
     function generateCaptcha() {
       const a = Math.floor(Math.random() * 9) + 1;
       const b = Math.floor(Math.random() * 9) + 1;
-      const op = Math.random() > 0.5 ? '+' : '-';
-
       let question, answer;
-      if (op === '+') {
+
+      if (Math.random() > 0.5) {
         question = a + ' + ' + b + ' = ?';
         answer = a + b;
       } else {
+        // 保证结果为正数
         const max = Math.max(a, b);
         const min = Math.min(a, b);
         question = max + ' - ' + min + ' = ?';
@@ -663,10 +1089,11 @@ function generateHTML() {
       document.getElementById('loginBtn').disabled = true;
     }
 
+    /** 检查验证码是否正确，正确才启用登录按钮 */
     function checkCaptcha() {
-      const input = document.getElementById('captchaInput').value.trim();
+      const val = document.getElementById('captchaInput').value.trim();
       document.getElementById('loginBtn').disabled =
-        !(input !== '' && Number(input) === captchaAnswer);
+        !(val !== '' && Number(val) === captchaAnswer);
     }
 
     /* ---------- 页面初始化 ---------- */
@@ -677,11 +1104,13 @@ function generateHTML() {
       document.getElementById('captchaInput').addEventListener('input', checkCaptcha);
       document.getElementById('refreshCaptcha').addEventListener('click', generateCaptcha);
 
-      // 使用 sessionStorage：关闭浏览器/标签页后自动退出
+      // 尝试使用 sessionStorage 中的密码自动登录
+      // （关闭浏览器后 sessionStorage 会自动清除）
       const saved = sessionStorage.getItem('adminPassword');
       if (saved) tryAutoLogin(saved);
     });
 
+    /** 静默自动登录 */
     async function tryAutoLogin(pw) {
       try {
         const resp = await fetch('/login?password=' + encodeURIComponent(pw));
@@ -696,16 +1125,17 @@ function generateHTML() {
       } catch {}
     }
 
+    /** 显示主界面，隐藏登录框 */
     function showMainUI() {
       document.getElementById('loginDiv').style.display = 'none';
       document.getElementById('mainDiv').style.display = 'block';
       document.getElementById('logoutBtn').style.display = 'inline-flex';
     }
 
-    /* ---------- 登录 ---------- */
+    /* ---------- 登录按钮点击 ---------- */
     document.getElementById('loginBtn').addEventListener('click', async () => {
-      const input = document.getElementById('captchaInput').value.trim();
-      if (Number(input) !== captchaAnswer) {
+      // 二次校验验证码，防止绕过
+      if (Number(document.getElementById('captchaInput').value.trim()) !== captchaAnswer) {
         alert('验证码错误');
         generateCaptcha();
         return;
@@ -718,7 +1148,7 @@ function generateHTML() {
         const resp = await fetch('/login?password=' + encodeURIComponent(pw));
         if (resp.status === 200) {
           ADMIN_PASSWORD = pw;
-          sessionStorage.setItem('adminPassword', pw);
+          sessionStorage.setItem('adminPassword', pw); // 使用 sessionStorage
           showMainUI();
           loadKeyList(1);
           resetInactivityTimer();
@@ -732,7 +1162,7 @@ function generateHTML() {
       }
     });
 
-    /* ---------- 退出登录 ---------- */
+    /* ---------- 退出登录按钮 ---------- */
     document.getElementById('logoutBtn').addEventListener('click', () => {
       if (confirm('确定要退出登录吗？')) doLogout(false);
     });
@@ -746,7 +1176,7 @@ function generateHTML() {
       resetInactivityTimer();
     });
 
-    /* ---------- 保存 / 更新 ---------- */
+    /* ---------- 保存 / 更新订阅 ---------- */
     document.getElementById('saveBtn').addEventListener('click', async () => {
       const displayName = document.getElementById('key').value.trim() || '未命名';
       const text = document.getElementById('text').value.trim();
@@ -755,6 +1185,7 @@ function generateHTML() {
       if (!text) return alert('请输入订阅内容');
 
       try {
+        // 根据是否处于编辑状态选择不同接口
         const url = currentEditingKey
           ? '/update?key=' + encodeURIComponent(currentEditingKey) +
             '&displayName=' + encodeURIComponent(displayName) +
@@ -767,6 +1198,7 @@ function generateHTML() {
         const resp = await fetch(url, { method: 'POST', body: text });
         alert(await resp.text());
 
+        // 重置表单
         currentEditingKey = null;
         document.getElementById('saveBtn').textContent = '保存订阅';
         ['key', 'text', 'days'].forEach(id => document.getElementById(id).value = '');
@@ -778,7 +1210,7 @@ function generateHTML() {
       }
     });
 
-    /* ---------- 加载列表 ---------- */
+    /* ---------- 加载订阅列表 ---------- */
     async function loadKeyList(page = 1) {
       if (!ADMIN_PASSWORD) return;
       currentPage = page;
@@ -799,56 +1231,77 @@ function generateHTML() {
 
         const data = await resp.json();
         const tbody = document.getElementById('keylist');
+        const mobileList = document.getElementById('mobileList');
         tbody.innerHTML = '';
+        mobileList.innerHTML = '';
 
-        data.items.forEach(item => {
-          const tr = document.createElement('tr');
-          tr.innerHTML =
-            '<td>' + item.displayName + '</td>' +
-            '<td>' + item.remainingDays + '</td>' +
-            '<td><button class="copy-btn">复制</button></td>' +
-            '<td><button class="copy-btn edit-btn">编辑</button></td>' +
-            '<td><button class="copy-btn delete-btn">删除</button></td>';
-          tbody.appendChild(tr);
+        if (data.items.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="3" class="empty">暂无订阅</td></tr>';
+          mobileList.innerHTML = '<div class="empty">暂无订阅</div>';
+        } else {
+          data.items.forEach(item => {
+            // ---------- 桌面端表格行 ----------
+            const tr = document.createElement('tr');
+            tr.innerHTML =
+              '<td><strong>' + item.displayName + '</strong></td>' +
+              '<td>' + item.remainingDays + '</td>' +
+              '<td style="white-space:nowrap">' +
+                '<button class="btn-copy" style="padding:5px 8px;border:none;border-radius:6px;color:#fff;font-size:12px;margin-right:4px;cursor:pointer">复制</button>' +
+                '<button class="btn-edit" style="padding:5px 8px;border:none;border-radius:6px;color:#fff;font-size:12px;margin-right:4px;cursor:pointer">编辑</button>' +
+                '<button class="btn-del" style="padding:5px 8px;border:none;border-radius:6px;color:#fff;font-size:12px;cursor:pointer">删除</button>' +
+              '</td>';
+            tbody.appendChild(tr);
 
-          // 复制双重密钥链接
-          tr.querySelector('.copy-btn').addEventListener('click', () => {
-            const fullUrl = window.location.origin + '/get/' +
-              encodeURIComponent(item.realKey) + '/' +
-              encodeURIComponent(item.token);
-            navigator.clipboard.writeText(fullUrl);
-            alert('已复制双重密钥链接!');
-            resetInactivityTimer();
+            tr.querySelector('.btn-copy').onclick = () => copyLink(item);
+            tr.querySelector('.btn-edit').onclick = () => { editItem(item.realKey); resetInactivityTimer(); };
+            tr.querySelector('.btn-del').onclick = () => { deleteKey(item.realKey); resetInactivityTimer(); };
+
+            // ---------- 手机端卡片 ----------
+            const card = document.createElement('div');
+            card.className = 'node-card';
+            card.innerHTML =
+              '<div class="node-card-title">' + item.displayName + '</div>' +
+              '<div class="node-card-meta">剩余天数：' + item.remainingDays + '</div>' +
+              '<div class="node-card-actions">' +
+                '<button class="btn-copy">复制链接</button>' +
+                '<button class="btn-edit">编辑</button>' +
+                '<button class="btn-del">删除</button>' +
+              '</div>';
+            mobileList.appendChild(card);
+
+            card.querySelector('.btn-copy').onclick = () => copyLink(item);
+            card.querySelector('.btn-edit').onclick = () => { editItem(item.realKey); resetInactivityTimer(); };
+            card.querySelector('.btn-del').onclick = () => { deleteKey(item.realKey); resetInactivityTimer(); };
           });
+        }
 
-          tr.querySelector('.edit-btn').addEventListener('click', () => {
-            editItem(item.realKey);
-            resetInactivityTimer();
-          });
-
-          tr.querySelector('.delete-btn').addEventListener('click', () => {
-            deleteKey(item.realKey);
-            resetInactivityTimer();
-          });
-        });
-
-        // 分页按钮
+        // ---------- 渲染分页按钮 ----------
         const pageDiv = document.getElementById('pagination');
         pageDiv.innerHTML = '';
         for (let i = 1; i <= data.totalPages; i++) {
           const btn = document.createElement('button');
           btn.textContent = i;
           if (i === data.page) btn.disabled = true;
-          btn.addEventListener('click', () => {
-            loadKeyList(i);
-            resetInactivityTimer();
-          });
+          btn.onclick = () => { loadKeyList(i); resetInactivityTimer(); };
           pageDiv.appendChild(btn);
         }
       } catch {}
     }
 
-    /* ---------- 编辑 ---------- */
+    /* ---------- 复制双重密钥订阅链接 ---------- */
+    function copyLink(item) {
+      const url = location.origin + '/get/' +
+        encodeURIComponent(item.realKey) + '/' +
+        encodeURIComponent(item.token);
+
+      navigator.clipboard.writeText(url)
+        .then(() => alert('已复制双重密钥链接'))
+        .catch(() => prompt('请手动复制：', url));
+
+      resetInactivityTimer();
+    }
+
+    /* ---------- 编辑指定订阅 ---------- */
     async function editItem(realKey) {
       const resp = await fetch(
         '/detail?key=' + encodeURIComponent(realKey) +
@@ -865,11 +1318,14 @@ function generateHTML() {
 
       currentEditingKey = realKey;
       document.getElementById('saveBtn').textContent = '更新订阅';
+      // 滚动到表单顶部，方便编辑
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
-    /* ---------- 删除 ---------- */
+    /* ---------- 删除指定订阅 ---------- */
     async function deleteKey(key) {
-      if (!confirm('确定删除?')) return;
+      if (!confirm('确定删除该订阅？')) return;
+
       const resp = await fetch(
         '/delete?key=' + encodeURIComponent(key) +
         '&password=' + encodeURIComponent(ADMIN_PASSWORD),
