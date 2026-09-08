@@ -16,6 +16,7 @@
  *        - 5 分钟无操作自动退出
  *        - 响应式布局（手机端卡片，桌面端表格）
  *   8. 统一简约错误页面（与主题同色系）
+ *   9. 返回订阅时附带 Subscription-Userinfo（到期时间 + 总流量）
  *
  * 【环境变量】
  *   NODES_KV              必须绑定（KV 命名空间）
@@ -27,6 +28,12 @@
  *
  * 【订阅链接格式】
  *   https://你的域名/get/{12位key}/{16位token}
+ *
+ * 【Subscription-Userinfo 响应头格式】
+ *   upload=0; download=0; total=107374182400; expire=1735689600
+ *   - upload / download : 已用流量（字节），当前固定为 0
+ *   - total             : 总流量配额（字节）
+ *   - expire            : 到期 Unix 时间戳（秒）
  * ============================================================
  */
 
@@ -34,7 +41,7 @@ export default {
   /**
    * Worker 入口函数
    * @param {Request} request  请求对象
-   * @param {object}  env      环境变量与绑定
+   * @param {object}  env      环境变量与绑定（KV、密码、TG 等）
    */
   async fetch(request, env) {
     try {
@@ -45,24 +52,24 @@ export default {
       // ================================================================
       // 一、读取环境变量并设置默认值
       // ================================================================
-      const ADMIN_PASSWORD = env.ADMIN_PASSWORD || "admin123";           // 管理员密码
-      const TG_TOKEN = env.TELEGRAM_BOT_TOKEN || "";                     // Telegram Bot Token
-      const TG_CHAT_ID = env.TELEGRAM_CHAT_ID || "";                     // Telegram 聊天 ID
-      const DEFAULT_EXPIRE_DAYS = parseInt(env.DEFAULT_EXPIRE_DAYS, 10) || 0; // 默认有效天数
-      const PAGE_SIZE = parseInt(env.PAGE_SIZE, 10) || 10;               // 列表每页条数
+      const ADMIN_PASSWORD = env.ADMIN_PASSWORD || "admin123";                 // 管理员密码
+      const TG_TOKEN = env.TELEGRAM_BOT_TOKEN || "";                           // Telegram Bot Token
+      const TG_CHAT_ID = env.TELEGRAM_CHAT_ID || "";                           // Telegram 聊天 ID
+      const DEFAULT_EXPIRE_DAYS = parseInt(env.DEFAULT_EXPIRE_DAYS, 10) || 0;  // 默认有效天数（0=永久）
+      const PAGE_SIZE = parseInt(env.PAGE_SIZE, 10) || 10;                     // 列表每页条数
 
       // ================================================================
       // 二、路径白名单校验
-      // 只允许以下路径，其余一律返回 404 错误页
+      // 只允许以下路径，其余一律返回统一错误页
       // ================================================================
       const allowedPaths = [
-        "/",          // 管理后台首页
-        "/login",     // 登录验证
-        "/save",      // 新增订阅
-        "/update",    // 更新订阅
-        "/delete",    // 删除订阅
-        "/list",      // 订阅列表
-        "/detail",    // 订阅详情
+        "/",        // 管理后台首页
+        "/login",   // 登录验证
+        "/save",    // 新增订阅
+        "/update",  // 更新订阅
+        "/delete",  // 删除订阅
+        "/list",    // 订阅列表
+        "/detail",  // 订阅详情
       ];
       if (!allowedPaths.includes(path) && !path.startsWith("/get/")) {
         return errorPage(404, "页面不存在");
@@ -74,15 +81,15 @@ export default {
       }
 
       // ================================================================
-      // 三、获取客户端基础信息（用于日志与通知）
+      // 三、获取客户端基础信息（用于日志与 Telegram 通知）
       // ================================================================
       const ua = request.headers.get("user-agent") || "未知设备";
       const ip = (
-        request.headers.get("cf-connecting-ip") ||   // Cloudflare 真实 IP
-        request.headers.get("x-forwarded-for") ||    // 兼容其他代理
+        request.headers.get("cf-connecting-ip") ||   // Cloudflare 提供的真实 IP
+        request.headers.get("x-forwarded-for") ||    // 兼容其他反向代理
         "未知IP"
       )
-        .split(",")[0]   // 取第一个 IP（防止多级代理）
+        .split(",")[0]  // 取第一个 IP（防止多级代理）
         .trim();
 
       // 解析 IP 地理位置（国内源优先，失败则回退）
@@ -102,22 +109,13 @@ export default {
           return errorPage(400, "缺少密钥");
         }
 
-        const realKey = parts[0];          // 订阅唯一标识
-        const providedToken = parts[1];    // 用户提供的 token
+        const realKey = parts[0];          // 订阅唯一标识（12 位）
+        const providedToken = parts[1];    // 用户提供的 token（16 位）
 
         // 允许的客户端 UA 关键词（不区分大小写）
         const uaList = [
-          "clash",
-          "quantumult",
-          "surge",
-          "shadowrocket",
-          "v2ray",
-          "sing-box",
-          "loon",
-          "v2rayng",
-          "nekobox",
-          "tbox",
-          "passwall",
+          "clash", "quantumult", "surge", "shadowrocket", "v2ray",
+          "sing-box", "loon", "v2rayng", "nekobox", "tbox", "passwall",
         ];
         const clientUA = ua.toLowerCase();
 
@@ -128,7 +126,7 @@ export default {
 
         // ---------- 4.2 UA 白名单检测 ----------
         if (!uaList.some((x) => clientUA.includes(x))) {
-          // 非法客户端访问，推送告警
+          // 非法客户端访问，推送告警通知
           await sendTG(TG_TOKEN, TG_CHAT_ID, "❌ 订阅访问被拦截（非法客户端）", {
             "提取 🔑": `${realKey.slice(0, 4)}****${realKey.slice(-4)}`,
             "访问位置": cfLocation,
@@ -138,7 +136,7 @@ export default {
           return errorPage(403, "未授权客户端");
         }
 
-        // ---------- 4.3 访问频率限制（同 Key + 同 IP 60 秒一次） ----------
+        // ---------- 4.3 访问频率限制（同 Key + 同 IP 60 秒只能访问一次） ----------
         const limitKey = `limit:${realKey}:${ip}`;
         if (await kv.get(limitKey)) {
           return errorPage(429, "请求过于频繁，请60秒后再试");
@@ -159,7 +157,7 @@ export default {
           return errorPage(500, "订阅数据异常");
         }
 
-        // ---------- 4.5 验证 token（双重密钥核心） ----------
+        // ---------- 4.5 验证 token（双重密钥核心校验） ----------
         if (!item.token || item.token !== providedToken) {
           await sendTG(TG_TOKEN, TG_CHAT_ID, "❌ 订阅访问被拦截（Token错误）", {
             "提取 🔑": `${realKey.slice(0, 4)}****${realKey.slice(-4)}`,
@@ -191,11 +189,24 @@ export default {
           "客户端 UA": ua,
         });
 
-        // ---------- 4.8 返回 Base64 编码后的订阅内容 ----------
+        // ---------- 4.8 组装 Subscription-Userinfo 响应头 ----------
+        // 格式：upload=0; download=0; total=字节数; expire=Unix时间戳（秒）
+        // 方案 A：已用流量固定为 0，只返回总流量和到期时间
+        const totalBytes = item.totalTraffic || 0;                    // 总流量（字节）
+        const expireTs = item.expire ? Math.floor(item.expire / 1000) : 0; // 转为秒级时间戳
+
+        let userinfo = `upload=0; download=0; total=${totalBytes}`;
+        if (expireTs > 0) {
+          userinfo += `; expire=${expireTs}`;
+        }
+
+        // ---------- 4.9 返回 Base64 编码的订阅内容 + 流量信息头 ----------
         return new Response(safeBtoa(item.content), {
           headers: {
             "Content-Type": "text/plain;charset=UTF-8",
-            "Cache-Control": "no-store", // 禁止缓存，保证内容实时
+            "Cache-Control": "no-store",                 // 禁止缓存，保证内容实时
+            "Subscription-Userinfo": userinfo,           // 流量与到期信息（主流客户端支持）
+            "Profile-Update-Interval": "24",             // 建议客户端 24 小时更新一次
           },
         });
       }
@@ -261,7 +272,7 @@ export default {
       // 九、新增或更新订阅
       // ================================================================
       if (path === "/save" || path === "/update") {
-        // 订阅内容从请求体读取
+        // 订阅原始内容从请求体读取
         const content = await request.text();
         if (!content) {
           return errorPage(400, "缺少内容");
@@ -288,24 +299,34 @@ export default {
           old?.token || crypto.randomUUID().replace(/-/g, "").slice(0, 16);
 
         const now = Date.now();
+
         // 优先使用前端传的天数，否则使用环境变量默认值
         const daysParam = parseInt(url.searchParams.get("days"), 10);
         const finalDays = Number.isNaN(daysParam)
           ? DEFAULT_EXPIRE_DAYS
           : daysParam;
 
-        // 组装存储对象
+        // 总流量（GB）→ 字节
+        // 1 GB = 1024³ = 1073741824 字节
+        const trafficGB = parseFloat(url.searchParams.get("traffic")) || 0;
+        const totalTraffic =
+          trafficGB > 0
+            ? Math.floor(trafficGB * 1073741824)
+            : old?.totalTraffic || 0;
+
+        // 组装要存入 KV 的对象
         const item = {
-          realKey: key,                                                    // 唯一标识
-          token: token,                                                    // 双重密钥
-          displayName: url.searchParams.get("displayName") || "未命名",    // 显示名称
-          content: content,                                                // 订阅原始内容
+          realKey: key,                                                     // 唯一标识
+          token: token,                                                     // 双重密钥
+          displayName: url.searchParams.get("displayName") || "未命名",     // 显示名称
+          content: content,                                                 // 订阅原始内容
           // 天数 > 0 时设置过期时间，否则保持原过期时间或永久
           expire:
             finalDays > 0
               ? now + finalDays * 86400000
               : old?.expire || null,
-          created: old?.created || now,                                    // 创建时间
+          totalTraffic: totalTraffic,                                       // 总流量（字节）
+          created: old?.created || now,                                     // 创建时间
         };
 
         // 写入 KV
@@ -320,6 +341,7 @@ export default {
             "订阅名称": item.displayName,
             "提取 🔑": key,
             "Token": token,
+            "总流量": trafficGB > 0 ? trafficGB + " GB" : "未设置",
           }
         );
 
@@ -373,6 +395,10 @@ export default {
                 ? "已过期"
                 : Math.ceil((i.expire - Date.now()) / 86400000)
               : "∞",
+            // 显示总流量（GB），保留 1 位小数
+            totalTrafficGB: i.totalTraffic
+              ? (i.totalTraffic / 1073741824).toFixed(1)
+              : "0",
           }));
 
         // 关键词过滤（匹配名称或 key）
@@ -412,8 +438,10 @@ export default {
 /* ============================================================
  * 统一错误页面
  * 简约居中卡片风格，与管理后台同色系
- * @param {number} status   HTTP 状态码
+ *
+ * @param {number} status   HTTP 状态码（如 403、404、500）
  * @param {string} message  错误提示文案
+ * @returns {Response}      HTML 错误页响应
  * ============================================================ */
 function errorPage(status, message) {
   const html = `<!DOCTYPE html>
@@ -515,7 +543,7 @@ function errorPage(status, message) {
  *
  * @param {string} ip  客户端 IP
  * @param {object} cf  Cloudflare request.cf 对象
- * @returns {object}   { location, isp, asn, source }
+ * @returns {Promise<object>}  { location, isp, asn, source }
  */
 async function getIPLocation(ip, cf = {}) {
   // ---------- 1. 优先使用国内源 ----------
@@ -641,7 +669,7 @@ ${bodyLines}
 
 /**
  * 生成前端管理页面 HTML
- * 包含登录、验证码、列表、新增/编辑、响应式布局等全部前端逻辑
+ * 包含登录、验证码、列表、新增/编辑、流量设置、响应式布局等全部前端逻辑
  */
 function generateHTML() {
   return `<!DOCTYPE html>
@@ -986,6 +1014,9 @@ function generateHTML() {
         <label>有效天数（0 = 永久）</label>
         <input type="number" id="days" placeholder="例如 30" min="0">
 
+        <label>总流量（GB，0 = 不限制）</label>
+        <input type="number" id="traffic" placeholder="例如 100" min="0" step="0.1">
+
         <button id="saveBtn" class="btn btn-primary">保存订阅</button>
       </div>
 
@@ -999,6 +1030,7 @@ function generateHTML() {
             <tr>
               <th>名称</th>
               <th>剩余天数</th>
+              <th>总流量</th>
               <th style="width:90px">操作</th>
             </tr>
           </thead>
@@ -1181,6 +1213,7 @@ function generateHTML() {
       const displayName = document.getElementById('key').value.trim() || '未命名';
       const text = document.getElementById('text').value.trim();
       const days = parseInt(document.getElementById('days').value, 10) || 0;
+      const traffic = parseFloat(document.getElementById('traffic').value) || 0;
 
       if (!text) return alert('请输入订阅内容');
 
@@ -1190,9 +1223,11 @@ function generateHTML() {
           ? '/update?key=' + encodeURIComponent(currentEditingKey) +
             '&displayName=' + encodeURIComponent(displayName) +
             '&days=' + days +
+            '&traffic=' + traffic +
             '&password=' + encodeURIComponent(ADMIN_PASSWORD)
           : '/save?displayName=' + encodeURIComponent(displayName) +
             '&days=' + days +
+            '&traffic=' + traffic +
             '&password=' + encodeURIComponent(ADMIN_PASSWORD);
 
         const resp = await fetch(url, { method: 'POST', body: text });
@@ -1201,7 +1236,7 @@ function generateHTML() {
         // 重置表单
         currentEditingKey = null;
         document.getElementById('saveBtn').textContent = '保存订阅';
-        ['key', 'text', 'days'].forEach(id => document.getElementById(id).value = '');
+        ['key', 'text', 'days', 'traffic'].forEach(id => document.getElementById(id).value = '');
 
         loadKeyList(currentPage);
         resetInactivityTimer();
@@ -1236,15 +1271,18 @@ function generateHTML() {
         mobileList.innerHTML = '';
 
         if (data.items.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="3" class="empty">暂无订阅</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="4" class="empty">暂无订阅</td></tr>';
           mobileList.innerHTML = '<div class="empty">暂无订阅</div>';
         } else {
           data.items.forEach(item => {
+            const trafficText = item.totalTrafficGB > 0 ? item.totalTrafficGB + ' GB' : '不限';
+
             // ---------- 桌面端表格行 ----------
             const tr = document.createElement('tr');
             tr.innerHTML =
               '<td><strong>' + item.displayName + '</strong></td>' +
               '<td>' + item.remainingDays + '</td>' +
+              '<td>' + trafficText + '</td>' +
               '<td style="white-space:nowrap">' +
                 '<button class="btn-copy" style="padding:5px 8px;border:none;border-radius:6px;color:#fff;font-size:12px;margin-right:4px;cursor:pointer">复制</button>' +
                 '<button class="btn-edit" style="padding:5px 8px;border:none;border-radius:6px;color:#fff;font-size:12px;margin-right:4px;cursor:pointer">编辑</button>' +
@@ -1261,7 +1299,7 @@ function generateHTML() {
             card.className = 'node-card';
             card.innerHTML =
               '<div class="node-card-title">' + item.displayName + '</div>' +
-              '<div class="node-card-meta">剩余天数：' + item.remainingDays + '</div>' +
+              '<div class="node-card-meta">剩余：' + item.remainingDays + '　|　流量：' + trafficText + '</div>' +
               '<div class="node-card-actions">' +
                 '<button class="btn-copy">复制链接</button>' +
                 '<button class="btn-edit">编辑</button>' +
@@ -1314,6 +1352,10 @@ function generateHTML() {
       document.getElementById('text').value = item.content || '';
       document.getElementById('days').value = item.expire
         ? Math.max(0, Math.ceil((item.expire - Date.now()) / 86400000))
+        : 0;
+      // 字节转 GB 回填到表单
+      document.getElementById('traffic').value = item.totalTraffic
+        ? (item.totalTraffic / 1073741824).toFixed(1)
         : 0;
 
       currentEditingKey = realKey;
